@@ -26,7 +26,7 @@ enough to read.
 ## Links
 
 - Dashboard and pricing: https://usekibble.com
-- Source: https://github.com/henchiyb/kibble
+- Source: https://github.com/usekibble/cli
 - hello@usekibble.com
 
 MIT.
