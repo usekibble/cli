@@ -18,7 +18,12 @@ export interface KibbleConfig {
   organizationName?: string;
   /** Null while nobody has assigned this person to a team yet. */
   teamName?: string | null;
-  /** Opt-in to capability telemetry (skill/command/MCP names). Off by default. */
+  /**
+   * The organization's capability-reporting policy (skill, command and MCP
+   * server names, never contents), echoed by the server at link time and on
+   * every push. Owners set it in Settings; nothing here overrides it. Unknown
+   * until the first link, and treated as on until then, which is the default.
+   */
   capabilities?: boolean;
   /**
    * The organization's policy, echoed by the server at link time and on every

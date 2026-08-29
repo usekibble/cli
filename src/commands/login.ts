@@ -49,6 +49,8 @@ interface LinkResponse {
   teamName: string | null;
   /** Org policy: keep the background push scheduled on this machine. */
   autoCollect: boolean;
+  /** Org policy: report skill, command and MCP server names. Absent on older servers. */
+  collectCapabilities?: boolean;
 }
 
 interface OAuthError {
@@ -103,6 +105,7 @@ export async function login(opts: LoginOptions): Promise<void> {
     organizationName: linked.organizationName,
     teamName: linked.teamName,
     autoCollect: linked.autoCollect,
+    capabilities: linked.collectCapabilities ?? config.capabilities ?? true,
   };
   saveConfig(next);
 

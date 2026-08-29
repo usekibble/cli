@@ -15,7 +15,7 @@ program
     "Kibble collector -- reports AI coding agent token usage to your team's dashboard.\n" +
       "Counts only: never prompts, file contents, or tool arguments.",
   )
-  .version("0.2.0");
+  .version("0.2.1");
 
 program
   .command("login")
@@ -37,7 +37,6 @@ program
   .option("--dry-run", "print what would be sent, send nothing")
   .option("--server <url>", "Kibble server base URL")
   .option("--source <name>", 'parser: "core" (default, in-process, session ids) or "cli" (more clients)')
-  .option("--capabilities", "also report skill, command and MCP names (opt-in, names only)")
   .option("--quiet", "print one line per run (used by the hourly schedule)")
   .description("send daily usage aggregates")
   .action(push);
@@ -76,6 +75,9 @@ program
     console.log(`linked   ${config.linkToken ? "yes" : "no -- run 'kibble login'"}`);
     console.log(
       `collect  ${config.autoCollect === undefined ? "(unknown until login)" : config.autoCollect ? "automatic, required by the organization" : "manual or scheduled, your choice"}`,
+    );
+    console.log(
+      `skills   ${config.capabilities === false ? "not reported (organization policy)" : "skill, command and MCP names reported (organization policy)"}`,
     );
   });
 

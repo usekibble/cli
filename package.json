@@ -1,6 +1,6 @@
 {
   "name": "@usekibble/cli",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Kibble collector -- reports AI coding agent token usage. Counts only, never content.",
   "scripts": {
     "build": "tsc -p tsconfig.json",

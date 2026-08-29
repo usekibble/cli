@@ -1,4 +1,4 @@
-import { loadConfig } from "../config.js";
+import { loadConfig, saveConfig } from "../config.js";
 import { enforcePolicy } from "./schedule.js";
 import { scanCapabilities } from "../sources/capabilities.js";
 import { priceRecord } from "../sources/pricing.js";
@@ -90,8 +90,9 @@ export async function push(opts: {
   const percentiles = sessionPercentiles(result);
   if (percentiles) say(`\n${percentiles}`);
 
-  // Opt-in, off by default. Names only -- see sources/capabilities.ts.
-  const wantCapabilities = opts.capabilities ?? config.capabilities ?? false;
+  // The organization's policy, echoed at login and on every push; on until a
+  // server says otherwise. Names only -- see sources/capabilities.ts.
+  const wantCapabilities = opts.capabilities ?? config.capabilities ?? true;
   const priceOf = await priceRecord(rows.map((r) => r.model));
   const repos = scanRepos({ since, until, priceOf });
   if (repos.length > 0) say(`\n${summarizeRepos(repos).join("\n")}`);
@@ -149,8 +150,9 @@ export async function push(opts: {
     sessions?: number;
     capabilities?: number;
     repos?: number;
-    /** Org policy, echoed on every push so a change reaches this machine. */
+    /** Org policies, echoed on every push so a change reaches this machine. */
     autoCollect?: boolean;
+    collectCapabilities?: boolean;
   };
   console.log(
     (opts.quiet ? `${stamp()}  ` : "\n") +
@@ -162,6 +164,12 @@ export async function push(opts: {
   );
 
   enforcePolicy(config, body.autoCollect, (line) => console.log(opts.quiet ? `${stamp()}  ${line}` : line));
+  if (body.collectCapabilities !== undefined && body.collectCapabilities !== config.capabilities) {
+    saveConfig({ ...loadConfig(), capabilities: body.collectCapabilities });
+    console.log(
+      `${opts.quiet ? `${stamp()}  ` : ""}Your organization turned capability reporting ${body.collectCapabilities ? "on" : "off"}; applied from the next push.`,
+    );
+  }
 }
 
 /**

@@ -6,8 +6,11 @@ import { join } from "node:path";
  * Capability telemetry: which skills, slash commands, and MCP servers a machine
  * has, which of them actually fire, and what they cost to load.
  *
- * OPT-IN AND OFF BY DEFAULT. Nothing here runs unless `kibble push
- * --capabilities` is passed or `capabilities: true` is set in the config.
+ * ORGANIZATION POLICY. Whether this runs is the owner's decision for the whole
+ * organization (Settings, `collect_capabilities`), echoed to every machine at
+ * `kibble login` and on every push and stored as `capabilities` in the config.
+ * On by default; with it off the collector sends nothing from here and the
+ * server drops the section anyway.
  *
  * WHAT THIS READS, EXHAUSTIVELY:
  *   - the NAMES of entries in skill and command directories (a directory
