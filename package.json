@@ -20,7 +20,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "kibble": "./dist/index.js"
+    "kibble": "dist/index.js"
   },
   "files": [
     "dist"
