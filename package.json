@@ -1,0 +1,53 @@
+{
+  "name": "@usekibble/cli",
+  "version": "0.1.0",
+  "description": "Kibble collector -- reports AI coding agent token usage. Counts only, never content.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.ts",
+    "verify": "pnpm build && node scripts/verify-accuracy.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "cursor",
+    "tokens",
+    "cost",
+    "observability"
+  ],
+  "author": "Kibble <hello@usekibble.com>",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "kibble": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/henchiyb/kibble.git",
+    "directory": "packages/cli"
+  },
+  "dependencies": {
+    "@tokscale/cli": "4.14.0",
+    "@tokscale/core": "1.4.3",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.23.12",
+    "typescript": "^5"
+  },
+  "homepage": "https://usekibble.com",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/henchiyb/kibble/issues"
+  }
+}
