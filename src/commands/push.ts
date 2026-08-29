@@ -2,7 +2,7 @@ import { loadConfig } from "../config.js";
 import { enforcePolicy } from "./schedule.js";
 import { scanCapabilities } from "../sources/capabilities.js";
 import { priceRecord } from "../sources/pricing.js";
-import { scanRepos } from "../sources/repos.js";
+import { scanRepos, summarizeRepos } from "../sources/repos.js";
 import { createSource, parseSourceName } from "../sources/index.js";
 import type { CollectResult, NormalizedDailyUsage } from "../sources/types.js";
 
@@ -94,10 +94,7 @@ export async function push(opts: {
   const wantCapabilities = opts.capabilities ?? config.capabilities ?? false;
   const priceOf = await priceRecord(rows.map((r) => r.model));
   const repos = scanRepos({ since, until, priceOf });
-  if (repos.length > 0) {
-    const distinct = new Set(repos.map((r) => r.repo)).size;
-    say(`\n  repos: ${distinct} (names only, never paths)`);
-  }
+  if (repos.length > 0) say(`\n${summarizeRepos(repos).join("\n")}`);
 
   const capabilities = wantCapabilities
     ? scanCapabilities({
@@ -117,8 +114,10 @@ export async function push(opts: {
   if (opts.dryRun) {
     say(
       "\nDry run -- nothing sent. Payload is counts only: date, agent, model,\n" +
-        "provider, token totals, message count, cost, and opaque session ids.\n" +
-        "No prompts, no file contents, no repo paths.",
+        "provider, token totals, message count, cost, opaque session ids, repo and\n" +
+        "branch names, and per-repo activity counts (tool calls, errors, turns,\n" +
+        "edits, lines, hook failures) with tool, version and enum names.\n" +
+        "No prompts, no file contents, no tool arguments, no paths.",
     );
     return;
   }

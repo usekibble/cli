@@ -15,7 +15,7 @@ program
     "Kibble collector -- reports AI coding agent token usage to your team's dashboard.\n" +
       "Counts only: never prompts, file contents, or tool arguments.",
   )
-  .version("0.1.0");
+  .version("0.2.0");
 
 program
   .command("login")
