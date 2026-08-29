@@ -1,9 +1,10 @@
 {
   "name": "@usekibble/cli",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Kibble collector -- reports AI coding agent token usage. Counts only, never content.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts",
     "verify": "pnpm build && node scripts/verify-accuracy.mjs"
