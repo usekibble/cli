@@ -20,6 +20,12 @@ import { enforcePolicy, installed, removeSchedule } from "./schedule.js";
 
 /** Public, constant. The device grant's client_id is not a secret (RFC 8628 s5.6). */
 const CLIENT_ID = "kibble-cli";
+/**
+ * Nothing here waits on the network forever. A connection that is accepted and
+ * then never answered would otherwise hang `kibble login` with no way out but
+ * Ctrl-C, and hang the scheduled push into the next hour (see push.ts).
+ */
+const REQUEST_TIMEOUT_MS = 30_000;
 const GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 
 interface DeviceCodeResponse {
@@ -148,6 +154,7 @@ export async function logout(): Promise<void> {
     const res = await fetch(new URL("/api/cli/link", config.server), {
       method: "DELETE",
       headers: { authorization: `Bearer ${config.linkToken}` },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (res.ok) {
       console.log(`Revoked "${config.deviceName ?? "this device"}" on the server.`);
@@ -168,6 +175,7 @@ async function requestDeviceCode(server: string): Promise<DeviceCodeResponse> {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID, scope: "usage.write" }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -198,15 +206,23 @@ async function pollForToken(
       throw new Error("the code expired before it was approved -- run `kibble login` again");
     }
 
-    const res = await fetch(new URL("/api/auth/device/token", server), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        grant_type: GRANT_TYPE,
-        device_code: grant.device_code,
-        client_id: CLIENT_ID,
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(new URL("/api/auth/device/token", server), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          grant_type: GRANT_TYPE,
+          device_code: grant.device_code,
+          client_id: CLIENT_ID,
+        }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch {
+      // A dropped connection or a slow answer costs one interval, not the
+      // sign-in: the code is still good until `expires_in` runs out.
+      continue;
+    }
 
     if (res.ok) return (await res.json()) as TokenResponse;
 
@@ -259,6 +275,7 @@ async function exchangeForLinkToken(
       ...(deviceName?.trim() ? { name: deviceName.trim() } : {}),
       ...(previousToken ? { previousToken } : {}),
     }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {

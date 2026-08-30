@@ -26,6 +26,20 @@ export interface KibbleConfig {
    */
   capabilities?: boolean;
   /**
+   * The last UTC day a push landed for, so a machine that was offline reports
+   * what it missed instead of the fixed yesterday..today window. Advanced only
+   * after the server has accepted the rows, and never moved backwards.
+   */
+  lastPushedThrough?: string;
+  /**
+   * Fingerprint of the installed-but-never-fired capability rows, and when they
+   * were last sent. Those rows are most of the payload and change only when
+   * somebody installs or removes a skill, so an unchanged set is sent a few
+   * times a day rather than every hour. See `push.ts`.
+   */
+  capabilityDigest?: string;
+  capabilityDigestAt?: string;
+  /**
    * The organization's policy, echoed by the server at link time and on every
    * push: while true this machine keeps `kibble push` scheduled in the
    * background and starting at boot, and `kibble schedule uninstall` refuses.

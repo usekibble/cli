@@ -20,4 +20,6 @@ export function parseSourceName(value: string | undefined): SourceName {
 }
 
 export { TokscaleCliSource, TokscaleCoreSource };
+/** Both sidecars over one read of the transcripts. */
+export { scanLocal, scanRepos, scanCapabilities } from "./local.js";
 export * from "./types.js";
