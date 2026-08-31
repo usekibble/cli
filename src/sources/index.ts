@@ -22,4 +22,6 @@ export function parseSourceName(value: string | undefined): SourceName {
 export { TokscaleCliSource, TokscaleCoreSource };
 /** Both sidecars over one read of the transcripts. */
 export { scanLocal, scanRepos, scanCapabilities } from "./local.js";
+/** How each agent on this machine is billed: mode, tier, nothing that identifies. */
+export { readPlans, describePlans, PLAN_MODES, PLAN_TIERS } from "./plans.js";
 export * from "./types.js";

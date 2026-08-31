@@ -20,7 +20,14 @@ cron or Task Scheduler when your organization asks for it.
 Counts only: token totals, model names, opaque session ids, repository names,
 and, while your organization has capability reporting switched on, the names of
 the skills, slash commands and MCP servers installed here with how often each
-one fired. Never prompts, file contents, tool arguments.
+one fired. Per agent, how this machine is billed: a subscription and its tier
+(Max 5x, ChatGPT Pro), an API key, or a cloud provider's account. Never
+prompts, file contents, tool arguments.
+
+The billing mode is read from the login file each agent already keeps
+(`~/.claude.json`, `~/.codex/auth.json`). Those files also hold account,
+organization and machine ids, your email and live tokens; `src/sources/plans.ts`
+copies out the mode and the tier and nothing else leaves.
 
 Finding those skills means looking in three places: your `~/.claude`, the
 `.claude` of each checkout you have worked in, and each installed plugin. The
@@ -36,6 +43,7 @@ enough to read.
 
 ## Links
 
+- How to use Kibble, from install to reading the dashboard: https://usekibble.com/docs
 - Dashboard and pricing: https://usekibble.com
 - Source: https://github.com/usekibble/cli
 - hello@usekibble.com

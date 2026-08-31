@@ -5,6 +5,7 @@ import { enforcePolicy } from "./schedule.js";
 import type { CapabilityRecord } from "../sources/capabilities.js";
 import { priceRecord } from "../sources/pricing.js";
 import { scanLocal } from "../sources/local.js";
+import { describePlans, readPlans } from "../sources/plans.js";
 import { summarizeRepos } from "../sources/repos.js";
 import { createSource, parseSourceName } from "../sources/index.js";
 import type { CollectResult, NormalizedDailyUsage } from "../sources/types.js";
@@ -160,6 +161,12 @@ export async function push(opts: {
     });
     if (repos.length > 0) say(`\n${summarizeRepos(repos).join("\n")}`);
 
+    // How each agent is billed here: subscription, API key or a cloud account,
+    // with the tier. Read from the agents' own login files; the ids and tokens
+    // beside those fields stay in this process -- see sources/plans.ts.
+    const plans = readPlans();
+    if (plans.length > 0) say(`\n  billing:\n${describePlans(plans).join("\n")}`);
+
     // Installed-but-idle capabilities are most of the payload and change only
     // when somebody installs or removes something, so an unchanged set rides
     // along a few times a day rather than 24. The server upserts on
@@ -190,8 +197,10 @@ export async function push(opts: {
           "branch names, per-repo activity counts (tool calls, errors, turns,\n" +
           "edits, lines, hook failures) with tool, version and enum names, and,\n" +
           "while the organization asks for them, skill, command and MCP server\n" +
-          "names with invocation counts and description sizes.\n" +
-          "No prompts, no file contents, no tool arguments, no paths.",
+          "names with invocation counts and description sizes, and per agent\n" +
+          "how this machine is billed (subscription, API key or cloud) and the\n" +
+          "plan tier.\n" +
+          "No prompts, no file contents, no tool arguments, no paths, no ids.",
       );
       return;
     }
@@ -209,6 +218,7 @@ export async function push(opts: {
       sessions: result.sessions,
       capabilities: sending,
       repos,
+      plans,
     });
     const res = await postWithRetry(new URL("/api/ingest", server), config.linkToken, payload);
 
