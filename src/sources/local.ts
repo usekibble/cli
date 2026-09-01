@@ -19,7 +19,8 @@ import {
  * Claude Code transcripts are walked once and each record is handed to both
  * collectors, and files whose mtime predates the window are not opened at all.
  *
- * Codex has no capability data, so its sessions feed the repo collector alone.
+ * Codex sessions ride the same rule: one walk feeds the repo collector and the
+ * capability collector's Codex visitor together.
  */
 export interface ScanOptions {
   since: string;
@@ -58,9 +59,12 @@ export function scanLocal(
     for (const cwd of cwds) capabilityCollector.addCwd(cwd);
   }
 
-  if (repoCollector) {
+  if (repoCollector || capabilityCollector) {
     const codex = partitionByFloor(listJsonl(join(home, ".codex", "sessions")), floor);
-    readTranscripts(codex.recent, [repoCollector.codex()]);
+    readTranscripts(codex.recent, [
+      ...(repoCollector ? [repoCollector.codex()] : []),
+      ...(capabilityCollector ? [capabilityCollector.codexVisitor()] : []),
+    ]);
   }
 
   return {

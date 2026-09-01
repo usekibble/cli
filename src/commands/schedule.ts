@@ -322,20 +322,22 @@ function shellQuote(s: string): string {
 }
 
 /**
- * Drop our marker and the schedule lines under it. Older installs wrote one
- * line, current ones write two (hourly and @reboot); both end where the next
- * line stops mentioning our entry script.
+ * Drop our marker and our schedule lines wherever they sit. Matching by shape
+ * (an hourly or @reboot entry whose command mentions kibble and `push
+ * --quiet`) rather than by position under the marker, because a version of
+ * this CLI before 0.2.5 removed the marker and left the lines: those orphans
+ * must still be cleaned up by the next install or uninstall.
  */
 function withoutOurs(lines: string[]): { rest: string[]; had: boolean } {
+  const ours = /(^\d{1,2} \* \* \* \* |^@reboot ).*kibble.*push.*--quiet/i;
   const rest: string[] = [];
   let had = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i] === CRON_MARKER) {
+  for (const line of lines) {
+    if (line === CRON_MARKER || ours.test(line)) {
       had = true;
-      while (i + 1 < lines.length && /(^0 \* \* \* \* |^@reboot ).*push.*--quiet/.test(lines[i + 1]!)) i++;
       continue;
     }
-    rest.push(lines[i]!);
+    rest.push(line);
   }
   return { rest, had };
 }

@@ -173,7 +173,7 @@ export async function push(opts: {
     // (date, member, kind, name), so a row left out is a row left as it was.
     const idle = capabilities.filter(isIdle);
     const digest = createHash("sha256")
-      .update(JSON.stringify(idle.map((c) => [c.date, c.kind, c.name, c.descriptionTokens])))
+      .update(JSON.stringify(idle.map((c) => [c.agent, c.date, c.kind, c.name, c.descriptionTokens])))
       .digest("hex");
     const sentAt = Date.parse(config.capabilityDigestAt ?? "");
     const resendIdle =

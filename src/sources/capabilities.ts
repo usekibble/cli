@@ -29,7 +29,11 @@ import type { Rec, TranscriptVisitor } from "./transcripts.js";
  *     carrying the skill body, and the `attributionSkill` / `attributionMcpServer`
  *     stamps Claude Code puts on its own records together with that record's
  *     token usage,
- *   - the LENGTH of each installed skill's `description` frontmatter field.
+ *   - the LENGTH of each installed skill's `description` frontmatter field,
+ *   - the same directory-listing read of Codex's `~/.codex/skills` and
+ *     `~/.codex/prompts`, and from Codex session files the SERVER NAME of each
+ *     `McpToolCall` item. Codex writes no capability attribution and no
+ *     structured skill invocation, so those stay zero for Codex rows.
  *
  * Bodies and descriptions are measured and discarded; only their sizes are kept.
  *
@@ -43,6 +47,9 @@ import type { Rec, TranscriptVisitor } from "./transcripts.js";
 
 export type CapabilityKind = "skill" | "command" | "mcp";
 
+/** Which agent the row is a fact about. Every capability row carries one. */
+export type CapabilityAgent = "claude-code" | "codex";
+
 export interface UsageCounts {
   input_tokens?: number;
   output_tokens?: number;
@@ -51,6 +58,7 @@ export interface UsageCounts {
 }
 
 export interface CapabilityRecord {
+  agent: CapabilityAgent;
   date: string;
   kind: CapabilityKind;
   name: string;
@@ -349,6 +357,44 @@ export function inventory(home = homedir(), cwds: Iterable<string> = []): Invent
   return { skills, commands };
 }
 
+/**
+ * Every skill and custom prompt Codex can load on this machine.
+ *
+ * One root: `~/.codex/skills` for skills (the same SKILL.md shape Claude Code
+ * uses, so the description sizing is shared) and `~/.codex/prompts` for custom
+ * prompts, reported as commands. Codex has no plugin marketplace install
+ * record and no per-checkout capability directory to walk, so there are no
+ * project or plugin roots and no aliases.
+ */
+export function codexInventory(home = homedir()): Inventory {
+  const skills = new Map<string, InstalledCapability>();
+  const commands = new Map<string, InstalledCapability>();
+  for (const e of listEntries(join(home, ".codex", "skills"), "skill")) {
+    let realPath: string;
+    try {
+      realPath = realpathSync(e.path);
+    } catch {
+      continue;
+    }
+    skills.set(e.name, {
+      name: e.name,
+      source: "personal",
+      realPath,
+      descriptionTokens: descriptionTokensFor(realPath),
+    });
+  }
+  for (const e of listEntries(join(home, ".codex", "prompts"), "command")) {
+    let realPath: string;
+    try {
+      realPath = realpathSync(e.path);
+    } catch {
+      continue;
+    }
+    commands.set(e.name, { name: e.name, source: "personal", realPath, descriptionTokens: 0 });
+  }
+  return { skills, commands };
+}
+
 interface Bucket {
   invocations: number;
   triggerTyped: number;
@@ -385,9 +431,10 @@ function bucket(): Bucket {
  */
 export class CapabilityCollector {
   private readonly seenRequests = new Set<string>();
-  /** key: `${date}|${kind}|${name}` */
+  /** key: `${agent}|${date}|${kind}|${name}` */
   private readonly seen = new Map<string, Bucket>();
-  private readonly activeDates = new Set<string>();
+  /** Days each agent was active in the window; anchors that agent's idle rows. */
+  private readonly activeDates = new Map<CapabilityAgent, Set<string>>();
   /**
    * Working directories seen in the transcripts, which is how the project roots
    * are found. Collected during the walk rather than guessed from the encoded
@@ -409,14 +456,25 @@ export class CapabilityCollector {
     this.priceOf = options.priceOf ?? (() => 0);
   }
 
-  private readonly at = (date: string, kind: CapabilityKind, name: string): Bucket => {
-    const key = `${date}|${kind}|${name}`;
+  private readonly at = (
+    agent: CapabilityAgent,
+    date: string,
+    kind: CapabilityKind,
+    name: string,
+  ): Bucket => {
+    const key = `${agent}|${date}|${kind}|${name}`;
     let b = this.seen.get(key);
     if (!b) {
       b = bucket();
       this.seen.set(key, b);
     }
     return b;
+  };
+
+  private readonly active = (agent: CapabilityAgent, date: string): void => {
+    let dates = this.activeDates.get(agent);
+    if (!dates) this.activeDates.set(agent, (dates = new Set()));
+    dates.add(date);
   };
 
   /**
@@ -432,7 +490,9 @@ export class CapabilityCollector {
   }
 
   visitor(): TranscriptVisitor {
-    const { at, seenRequests, activeDates, cwds, priceOf, options } = this;
+    const { seenRequests, active, cwds, priceOf, options } = this;
+    const at = (date: string, kind: CapabilityKind, name: string) =>
+      this.at("claude-code", date, kind, name);
     // The command the user most recently typed, used to tell an explicitly
     // invoked capability from one the model reached for on its own.
     let lastTypedCommand: string | null = null;
@@ -484,7 +544,7 @@ export class CapabilityCollector {
         }
 
         if (role === "user") {
-          activeDates.add(date);
+          active("claude-code", date);
           // Typed slash commands arrive wrapped in <command-name> tags.
           const flat =
             typeof content === "string"
@@ -524,7 +584,7 @@ export class CapabilityCollector {
         }
 
         if (role !== "assistant" || !Array.isArray(content)) return;
-        activeDates.add(date);
+        active("claude-code", date);
 
         for (const blk of content) {
           const b = blk as {
@@ -559,16 +619,50 @@ export class CapabilityCollector {
     };
   }
 
+  /**
+   * Capability usage from Codex session files, driven over the same walk that
+   * feeds `repos.ts`.
+   *
+   * The only structured capability fact a Codex session carries is the server
+   * name on an `McpToolCall` item. A Codex skill fires by the model reading
+   * SKILL.md with an ordinary shell command, and counting that would mean
+   * reading command lines, which are content; so Codex skill rows come from
+   * the inventory alone, `invocations` zero.
+   */
+  codexVisitor(): TranscriptVisitor {
+    const { at, active, options } = this;
+    return {
+      record: (r: Rec) => {
+        const date = String(r.timestamp ?? "").slice(0, 10);
+        if (!date || date < options.since || date > options.until) return;
+        if (r.type !== "event_msg" && r.type !== "turn_context") return;
+        active("codex", date);
+        if (r.type !== "event_msg") return;
+        const payload = (r.payload ?? {}) as Record<string, unknown>;
+        if (payload.type !== "item_completed") return;
+        const item = (payload.item ?? {}) as Record<string, unknown>;
+        if (item.type !== "McpToolCall") return;
+        const server = String(item.server ?? "").trim();
+        if (server) at("codex", date, "mcp", server).invocations += 1;
+      },
+    };
+  }
+
   finish(): CapabilityRecord[] {
     const { home, cwds, seen, activeDates } = this;
-    const inv = inventory(home, cwds);
+    const inventories: Record<CapabilityAgent, Inventory> = {
+      "claude-code": inventory(home, cwds),
+      codex: codexInventory(home),
+    };
 
     const out: CapabilityRecord[] = [];
     for (const [key, b] of seen) {
-      const [date, kind, ...rest] = key.split("|");
+      const [agent, date, kind, ...rest] = key.split("|");
       const name = rest.join("|");
-      if (!date || !kind || !name) continue;
+      if (!agent || !date || !kind || !name) continue;
+      const inv = inventories[agent as CapabilityAgent];
       out.push({
+        agent: agent as CapabilityAgent,
         date,
         kind: kind as CapabilityKind,
         name,
@@ -589,11 +683,14 @@ export class CapabilityCollector {
       });
     }
 
-    // Installed but never invoked. Reported against the most recent active day so
-    // it lands in the window the dashboard is showing. This is the row that only a
-    // local collector can produce.
-    const anchor = [...activeDates].sort().pop();
-    if (anchor) {
+    // Installed but never invoked, per agent. Reported against that agent's most
+    // recent active day so it lands in the window the dashboard is showing, and
+    // not at all for an agent that never ran in the window. This is the row that
+    // only a local collector can produce.
+    for (const agent of ["claude-code", "codex"] as const) {
+      const anchor = [...(activeDates.get(agent) ?? [])].sort().pop();
+      if (!anchor) continue;
+      const inv = inventories[agent];
       for (const [kind, entries] of [
         ["skill", inv.skills],
         ["command", inv.commands],
@@ -604,7 +701,7 @@ export class CapabilityCollector {
         // project skill as `apps/web:deploy` and `deploy`.
         const fired = new Set<string>();
         for (const r of out) {
-          if (r.kind !== kind) continue;
+          if (r.agent !== agent || r.kind !== kind) continue;
           const at = entries.get(r.name)?.realPath;
           if (at) fired.add(at);
         }
@@ -613,9 +710,11 @@ export class CapabilityCollector {
           // it would file one skill as two.
           if (entry.alias) continue;
           const used =
-            fired.has(entry.realPath) || out.some((r) => r.kind === kind && r.name === name);
+            fired.has(entry.realPath) ||
+            out.some((r) => r.agent === agent && r.kind === kind && r.name === name);
           if (used) continue;
           out.push({
+            agent,
             date: anchor,
             kind,
             name,
