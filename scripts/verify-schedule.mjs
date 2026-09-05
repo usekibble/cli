@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,7 @@ const originalConfigHome = process.env.XDG_CONFIG_HOME;
 const originalHomedir = os.homedir;
 const originalSpawnSync = childProcess.spawnSync;
 const originalExecFileSync = childProcess.execFileSync;
+const originalFsyncSync = fs.fsyncSync;
 let crontab = "";
 let crontabWrites = 0;
 let launchdRegistered = false;
@@ -85,6 +86,13 @@ process.env.XDG_CONFIG_HOME = configHome;
 const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 process.argv = [process.execPath, cli];
 os.homedir = () => root;
+// Simulated POSIX schedulers still use the host filesystem. Windows cannot
+// fsync directories; preserve real file syncing while emulating that operation.
+if (originalPlatform === "win32") {
+  fs.fsyncSync = (fd) => {
+    if (!fs.fstatSync(fd).isDirectory()) originalFsyncSync(fd);
+  };
+}
 childProcess.spawnSync = (command, args = []) => {
   if (command === "launchctl") {
     if (args[0] === "print") {
@@ -252,6 +260,7 @@ try {
 
   childProcess.spawnSync = originalSpawnSync;
   childProcess.execFileSync = originalExecFileSync;
+  fs.fsyncSync = originalFsyncSync;
   syncBuiltinESMExports();
 
   const env = { ...process.env };
