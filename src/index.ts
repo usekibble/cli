@@ -18,7 +18,7 @@ program
     "Kibble collector -- reports AI coding agent token usage to your team's dashboard.\n" +
       "Counts only: never prompts, file contents, or tool arguments.",
   )
-  .version("0.3.0");
+  .version("0.4.0");
 
 program.addOption(new Option("--config-home <path>").hideHelp());
 program.hook("preAction", () => {
