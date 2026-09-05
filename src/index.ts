@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { isAbsolute } from "node:path";
+import { Command, Option } from "commander";
 import { login, logout } from "./commands/login.js";
 import { push } from "./commands/push.js";
 import { scheduleInstall, scheduleStatus, scheduleUninstall } from "./commands/schedule.js";
+import { skillInstall, skillShow, skillUninstall } from "./commands/skill.js";
+import { usage } from "./commands/usage.js";
 import { loadConfig, configPath } from "./config.js";
 import { devicePath } from "./device.js";
-import { createSource, parseSourceName } from "./sources/index.js";
+import { createSource } from "./sources/index.js";
 
 const program = new Command();
 
@@ -16,6 +19,16 @@ program
       "Counts only: never prompts, file contents, or tool arguments.",
   )
   .version("0.3.0");
+
+program.addOption(new Option("--config-home <path>").hideHelp());
+program.hook("preAction", () => {
+  const configHome = program.opts<{ configHome?: string }>().configHome;
+  if (configHome === undefined) return;
+  if (!isAbsolute(configHome)) {
+    throw new Error("--config-home must be an absolute path");
+  }
+  process.env.XDG_CONFIG_HOME = configHome;
+});
 
 program
   .command("login")
@@ -36,10 +49,38 @@ program
   .option("--until <date>", "inclusive UTC end date, YYYY-MM-DD")
   .option("--dry-run", "print what would be sent, send nothing")
   .option("--server <url>", "Kibble server base URL")
-  .option("--source <name>", 'parser: "core" (default, in-process, session ids) or "cli" (more clients)')
   .option("--quiet", "print one line per run (used by the hourly schedule)")
   .description("send daily usage aggregates")
   .action(push);
+
+program
+  .command("usage")
+  .option("--range <window>", "day, week, month (default), or 90d")
+  .option("--since <date>", "inclusive UTC start date, YYYY-MM-DD (with --until)")
+  .option("--until <date>", "inclusive UTC end date, YYYY-MM-DD (with --since)")
+  .option("--json", "print the server's full answer as JSON, for scripts and agents")
+  .option("--server <url>", "Kibble server base URL")
+  .description("read your own usage back from the dashboard (totals, trend, agents, models)")
+  .action(usage);
+
+const skill = program
+  .command("skill")
+  .description(
+    "the kibble-usage skill: teach your coding agent to analyse your usage\n" +
+      "through `kibble usage --json` (your own data only, counts only)",
+  );
+skill
+  .command("install")
+  .description("write SKILL.md into ~/.claude/skills (and ~/.codex/skills when Codex is installed)")
+  .action(skillInstall);
+skill
+  .command("uninstall")
+  .description("remove the installed skill")
+  .action(skillUninstall);
+skill
+  .command("show")
+  .description("print the skill to stdout, for any other agent's skill directory")
+  .action(skillShow);
 
 const schedule = program
   .command("schedule")
@@ -83,10 +124,9 @@ program
 
 program
   .command("doctor")
-  .option("--source <name>", 'parser to check: "core" or "cli"')
   .description("check that the underlying parser is present and working")
-  .action(async (opts: { source?: string }) => {
-    const source = createSource(parseSourceName(opts.source));
+  .action(async () => {
+    const source = createSource();
     try {
       console.log(`parser   ${source.name}`);
       console.log(`version  ${await source.version()}`);

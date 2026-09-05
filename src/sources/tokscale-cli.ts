@@ -12,12 +12,11 @@ import {
 /**
  * Lane A via the tokscale CLI binary.
  *
- * The fallback source. It covers far more clients than the Rust library (50+ vs
- * 9) and its pricing table is kept current, so it is the right choice for a team
- * running agents the library does not parse. What it cannot provide is session
- * ids: `tokscale graph` aggregates to day x client x model, so this source
- * returns no sessions and the dedup ledger and session percentiles are
- * unavailable when it is selected.
+ * The broad fallback behind `TokscaleHybridSource`. It covers far more clients
+ * than the Rust library (50+ vs 9), but its overlapping Claude Code parser is
+ * not accurate enough to use. The hybrid admits rows from this source only for
+ * agents the core does not support. `tokscale graph` aggregates to day x client
+ * x model, so the current CLI export provides no session ids.
  */
 
 interface GraphClientEntry {

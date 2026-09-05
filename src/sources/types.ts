@@ -4,10 +4,20 @@
  * Kibble never talks to a log parser directly. Parsers are third-party,
  * fast-moving, and single-maintainer (plan section 10) -- so everything
  * downstream depends on this interface instead, and swapping one for another is
- * a new file rather than a rewrite. Two implementations ship today:
- * `TokscaleCoreSource` (the Rust library, in-process) and `TokscaleCliSource`
- * (the CLI binary, broader client coverage).
+ * a new file rather than a rewrite. Three implementations ship today:
+ * `TokscaleCoreSource` (the Rust library, in-process), `TokscaleCliSource`
+ * (the CLI binary, broader client coverage), and `TokscaleHybridSource`, which
+ * combines core rows with CLI-only agents.
  */
+
+import type { PricingContext } from "./pricing.js";
+
+/** Shared dependencies whose cache lifetime is one collection run. */
+export interface SourceContext {
+  pricing?: PricingContext;
+  /** Override only for isolated collector fixtures. */
+  home?: string;
+}
 
 /**
  * One day of usage for one (agent, model) pair on this machine.

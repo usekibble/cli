@@ -1,5 +1,6 @@
-import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 /**
  * One walk, one read, one parse.
@@ -31,7 +32,7 @@ export interface TranscriptFile {
 
 export interface TranscriptVisitor {
   /** Reset per-file state. Called before the first record of each file. */
-  startFile?(): void;
+  startFile?(file?: TranscriptFile): void;
   record(rec: Rec): void;
 }
 
@@ -40,6 +41,9 @@ const MTIME_MARGIN_MS = 24 * 60 * 60 * 1000;
 
 /** Enough of a transcript to find the working directory it opened in. */
 const HEAD_BYTES = 16 * 1024;
+
+/** Bound file reads while still allowing a JSONL record to span any number of reads. */
+const READ_BYTES = 64 * 1024;
 
 /** The epoch millisecond before which a file cannot hold a record in range. */
 export function transcriptFloor(since: string): number {
@@ -52,16 +56,17 @@ export function listJsonl(dir: string, out: TranscriptFile[] = []): TranscriptFi
   let entries: string[];
   try {
     entries = readdirSync(dir);
-  } catch {
-    return out;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return out;
+    throw new Error("could not list transcript files", { cause });
   }
   for (const name of entries) {
     const path = join(dir, name);
     let st;
     try {
       st = statSync(path);
-    } catch {
-      continue;
+    } catch (cause) {
+      throw new Error("could not inspect a transcript file", { cause });
     }
     if (st.isDirectory()) listJsonl(path, out);
     else if (name.endsWith(".jsonl")) out.push({ path, mtimeMs: st.mtimeMs });
@@ -80,26 +85,78 @@ export function partitionByFloor(
   return { recent, older };
 }
 
+/** Parse one complete JSONL line and hand the same record to every visitor. */
+function visitLine(line: string, visitors: TranscriptVisitor[]): void {
+  if (!line) return;
+  let rec: Rec;
+  try {
+    rec = JSON.parse(line) as Rec;
+  } catch {
+    return;
+  }
+  for (const visitor of visitors) visitor.record(rec);
+}
+
 /** Read each file once, parse each line once, hand the record to every visitor. */
 export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVisitor[]): void {
   if (visitors.length === 0) return;
+  const chunk = Buffer.allocUnsafe(READ_BYTES);
   for (const file of files) {
-    let text: string;
+    let fd: number;
     try {
-      text = readFileSync(file.path, "utf8");
-    } catch {
-      continue;
+      fd = openSync(file.path, "r");
+    } catch (cause) {
+      throw new Error("could not open a transcript", { cause });
     }
-    for (const visitor of visitors) visitor.startFile?.();
-    for (const line of text.split("\n")) {
-      if (!line) continue;
-      let rec: Rec;
+
+    try {
+      // Even the first failed read must abort: an incomplete day cannot replace
+      // the server's previous complete aggregate.
+      let bytesRead: number;
       try {
-        rec = JSON.parse(line) as Rec;
-      } catch {
-        continue;
+        bytesRead = readSync(fd, chunk, 0, chunk.length, null);
+      } catch (cause) {
+        throw new Error("could not start reading a transcript", { cause });
       }
-      for (const visitor of visitors) visitor.record(rec);
+
+      for (const visitor of visitors) visitor.startFile?.(file);
+
+      const decoder = new StringDecoder("utf8");
+      const fragments: string[] = [];
+
+      while (bytesRead > 0) {
+        const text = decoder.write(chunk.subarray(0, bytesRead));
+        let start = 0;
+        let newline = text.indexOf("\n");
+
+        while (newline !== -1) {
+          const fragment = text.slice(start, newline);
+          if (fragments.length === 0) {
+            visitLine(fragment, visitors);
+          } else {
+            fragments.push(fragment);
+            visitLine(fragments.join(""), visitors);
+            fragments.length = 0;
+          }
+          start = newline + 1;
+          newline = text.indexOf("\n", start);
+        }
+        if (start < text.length) fragments.push(text.slice(start));
+
+        try {
+          bytesRead = readSync(fd, chunk, 0, chunk.length, null);
+        } catch (cause) {
+          // A partial scan cannot replace a complete daily aggregate on ingest.
+          // Abort the push instead of publishing only the records read so far.
+          throw new Error("could not finish reading a transcript", { cause });
+        }
+      }
+
+      const tail = decoder.end();
+      if (tail) fragments.push(tail);
+      if (fragments.length > 0) visitLine(fragments.join(""), visitors);
+    } finally {
+      closeSync(fd);
     }
   }
 }
@@ -134,7 +191,7 @@ function head(path: string, bytes: number): string {
  * Claude Code stamps `cwd` on every record, so the head of the file answers it.
  * The last line of the head is dropped: at 16 KB it is usually cut in half.
  */
-export function harvestCwds(files: TranscriptFile[], into: Set<string>): void {
+export function harvestCwds(files: TranscriptFile[], into: Set<string>, agent: "claude-code" | "codex" = "claude-code"): void {
   for (const file of files) {
     const text = head(file.path, HEAD_BYTES);
     if (!text) continue;
@@ -148,7 +205,8 @@ export function harvestCwds(files: TranscriptFile[], into: Set<string>): void {
       } catch {
         continue;
       }
-      const cwd = rec.cwd;
+      const payload = rec.payload && typeof rec.payload === "object" ? rec.payload as Rec : {};
+      const cwd = agent === "codex" ? payload.cwd : rec.cwd;
       if (typeof cwd === "string" && cwd) into.add(cwd);
     }
   }

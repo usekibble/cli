@@ -54,10 +54,6 @@ const INTERVAL_SECONDS = 3600;
 export const POLICY_MESSAGE =
   "Your organization requires automatic collection, so the schedule stays. An owner or admin can turn it off under Settings.";
 
-export interface ScheduleOptions {
-  server?: string;
-}
-
 /** Where the scheduled push writes. Next to config.json, not in $TMPDIR. */
 export function logPath(): string {
   return join(dirname(configPath()), "push.log");
@@ -99,7 +95,15 @@ function pushCommand(): { node: string; script: string; args: string[] } {
       "refusing to schedule the TypeScript source -- build first (`pnpm build`) and run `node dist/index.js schedule install`, or install the published CLI",
     );
   }
-  return { node: process.execPath, script, args: ["push", "--quiet"] };
+  // OS schedulers do not inherit the shell that launched `schedule install`.
+  // Pin the XDG base that contains this invocation's config so a custom
+  // XDG_CONFIG_HOME keeps working after login, reboot, or an hourly launch.
+  const configHome = resolve(dirname(dirname(configPath())));
+  return {
+    node: process.execPath,
+    script,
+    args: ["--config-home", configHome, "push", "--quiet"],
+  };
 }
 
 function xml(s: string): string {
@@ -118,13 +122,21 @@ function launchdDomain(): string {
 
 /** Whether the background push is registered with this machine's scheduler. */
 export function installed(): boolean {
+  let cmd: ReturnType<typeof pushCommand>;
+  try {
+    cmd = pushCommand();
+  } catch {
+    return false;
+  }
+  const log = logPath();
+
   switch (process.platform) {
     case "darwin":
-      return existsSync(plistPath());
+      return launchdInstalled(cmd, log);
     case "linux":
-      return readCrontab().some((l) => l === CRON_MARKER);
+      return cronInstalled(cmd, log);
     case "win32":
-      return spawnSync("schtasks", ["/Query", "/TN", LABEL], { stdio: "ignore" }).status === 0;
+      return schtasksInstalled(cmd, log);
     default:
       return false;
   }
@@ -180,7 +192,7 @@ export function enforcePolicy(
   }
 }
 
-export async function scheduleInstall(_opts: ScheduleOptions): Promise<void> {
+export async function scheduleInstall(): Promise<void> {
   const config = loadConfig();
   if (!config.linkToken) {
     throw new Error("Not linked. Run `kibble login` first, then `kibble schedule install`.");
@@ -257,10 +269,9 @@ export async function scheduleStatus(): Promise<void> {
 
 /* ------------------------------- macOS ------------------------------------ */
 
-function installLaunchd(cmd: ReturnType<typeof pushCommand>, log: string): void {
-  const path = plistPath();
+function launchdPlist(cmd: ReturnType<typeof pushCommand>, log: string): string {
   const argv = [cmd.node, cmd.script, ...cmd.args];
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -286,12 +297,35 @@ ${argv.map((a) => `    <string>${xml(a)}</string>`).join("\n")}
 </dict>
 </plist>
 `;
+}
+
+function launchdInstalled(cmd: ReturnType<typeof pushCommand>, log: string): boolean {
+  const registered = spawnSync(
+    "launchctl",
+    ["print", `${launchdDomain()}/${LABEL}`],
+    { stdio: "ignore" },
+  );
+  if (registered.status !== 0) return false;
+  try {
+    return readFileSync(plistPath(), "utf8") === launchdPlist(cmd, log);
+  } catch {
+    return false;
+  }
+}
+
+function installLaunchd(cmd: ReturnType<typeof pushCommand>, log: string): void {
+  const path = plistPath();
   mkdirSync(dirname(path), { recursive: true });
   // Unload any previous copy first so a changed node path takes effect.
   spawnSync("launchctl", ["bootout", `${launchdDomain()}/${LABEL}`], { stdio: "ignore" });
-  writeFileSync(path, plist, { mode: 0o644 });
+  writeFileSync(path, launchdPlist(cmd, log), { mode: 0o644 });
   const res = spawnSync("launchctl", ["bootstrap", launchdDomain(), path], { encoding: "utf8" });
   if (res.status !== 0) {
+    // A plist is only an input to launchd, not proof that bootstrap accepted
+    // it. Remove the failed input so status and the next policy check can
+    // repair the registration instead of mistaking the file for a live job.
+    spawnSync("launchctl", ["bootout", `${launchdDomain()}/${LABEL}`], { stdio: "ignore" });
+    if (existsSync(path)) unlinkSync(path);
     throw new Error(`launchctl bootstrap failed: ${(res.stderr || res.stdout).trim()}`);
   }
 }
@@ -321,6 +355,27 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+function cronInvocation(cmd: ReturnType<typeof pushCommand>, log: string): string {
+  const command = [cmd.node, cmd.script, ...cmd.args].map(shellQuote).join(" ");
+  return `${command} >> ${shellQuote(log)} 2>&1`;
+}
+
+function cronInstalled(cmd: ReturnType<typeof pushCommand>, log: string): boolean {
+  const lines = readCrontab();
+  const markers = lines.reduce((count, line) => count + Number(line === CRON_MARKER), 0);
+  if (markers !== 1) return false;
+  const marker = lines.indexOf(CRON_MARKER);
+  const hourly = /^(\d{1,2}) \* \* \* \* (.*)$/.exec(lines[marker + 1] ?? "");
+  const minute = hourly ? Number(hourly[1]) : -1;
+  const invocation = cronInvocation(cmd, log);
+  return (
+    minute >= 0 &&
+    minute < 60 &&
+    hourly?.[2] === invocation &&
+    lines[marker + 2] === `@reboot ${invocation}`
+  );
+}
+
 /**
  * Drop our marker and our schedule lines wherever they sit. Matching by shape
  * (an hourly or @reboot entry whose command mentions kibble and `push
@@ -344,8 +399,7 @@ function withoutOurs(lines: string[]): { rest: string[]; had: boolean } {
 
 function installCron(cmd: ReturnType<typeof pushCommand>, log: string): void {
   const { rest } = withoutOurs(readCrontab());
-  const command = [cmd.node, cmd.script, ...cmd.args].map(shellQuote).join(" ");
-  const redirect = `>> ${shellQuote(log)} 2>&1`;
+  const invocation = cronInvocation(cmd, log);
   // Hourly, plus once when the machine comes up so a laptop that sleeps
   // through the top of the hour still reports. The minute is random per
   // install: launchd and schtasks already count from install time, cron
@@ -353,8 +407,8 @@ function installCron(cmd: ReturnType<typeof pushCommand>, log: string): void {
   const minute = Math.floor(Math.random() * 60);
   rest.push(
     CRON_MARKER,
-    `${minute} * * * * ${command} ${redirect}`,
-    `@reboot ${command} ${redirect}`,
+    `${minute} * * * * ${invocation}`,
+    `@reboot ${invocation}`,
   );
   writeCrontab(rest);
 }
@@ -367,9 +421,53 @@ function uninstallCron(): boolean {
 
 /* ------------------------------ Windows ----------------------------------- */
 
-function installSchtasks(cmd: ReturnType<typeof pushCommand>, log: string): void {
+function schtasksCommand(cmd: ReturnType<typeof pushCommand>, log: string): string {
   const inner = [cmd.node, cmd.script, ...cmd.args].map((a) => `"${a}"`).join(" ");
-  const tr = `cmd /c ${inner} >> "${log}" 2>&1`;
+  return `cmd /c ${inner} >> "${log}" 2>&1`;
+}
+
+function decodeXml(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&amp;/g, "&");
+}
+
+function xmlElement(document: string, name: string): string | undefined {
+  const match = new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, "i").exec(document);
+  const content = match?.[1];
+  return content === undefined ? undefined : decodeXml(content.trim());
+}
+
+function windowsAction(document: string): string | undefined {
+  const command = xmlElement(document, "Command");
+  if (!command) return undefined;
+  const args = xmlElement(document, "Arguments");
+  const executable = /(^|[\\/])cmd(?:\.exe)?$/i.test(command) ? "cmd" : command;
+  return args ? `${executable} ${args}` : executable;
+}
+
+function schtaskMatches(name: string, schedule: "HOURLY" | "ONLOGON", command: string): boolean {
+  const result = spawnSync("schtasks", ["/Query", "/TN", name, "/XML"], { encoding: "utf8" });
+  if (result.status !== 0 || typeof result.stdout !== "string") return false;
+  if (windowsAction(result.stdout) !== command) return false;
+  return schedule === "HOURLY"
+    ? /<Interval>\s*PT1H\s*<\/Interval>/i.test(result.stdout)
+    : /<LogonTrigger(?:\s[^>]*)?>/i.test(result.stdout);
+}
+
+function schtasksInstalled(cmd: ReturnType<typeof pushCommand>, log: string): boolean {
+  const command = schtasksCommand(cmd, log);
+  return (
+    schtaskMatches(LABEL, "HOURLY", command) &&
+    schtaskMatches(BOOT_LABEL, "ONLOGON", command)
+  );
+}
+
+function installSchtasks(cmd: ReturnType<typeof pushCommand>, log: string): void {
+  const tr = schtasksCommand(cmd, log);
   // Two tasks: one hourly, one when the person logs on. A per-user ONLOGON
   // task needs no elevation, unlike ONSTART.
   for (const [name, schedule] of [

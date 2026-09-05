@@ -10,39 +10,94 @@ interface Rates {
 
 const ZERO: Rates = { inputCostPerToken: 0, outputCostPerToken: 0 };
 
+export interface PricingRef {
+  model: string;
+  provider?: string | null;
+}
+
+export interface PricedUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+function ref(value: string | PricingRef): Required<PricingRef> {
+  return typeof value === "string"
+    ? { model: value, provider: "" }
+    : { model: value.model, provider: value.provider ?? "" };
+}
+
+function keyOf(value: string | PricingRef): string {
+  const { model, provider } = ref(value);
+  return JSON.stringify([provider, model]);
+}
+
+/** Apply native per-token rates and round once at the integer-money boundary. */
+export function pricedCostMicros(usage: PricedUsage, rates: Rates): number {
+  const dollars =
+    usage.input * rates.inputCostPerToken +
+    usage.output * rates.outputCostPerToken +
+    usage.cacheRead * (rates.cacheReadInputTokenCost ?? 0) +
+    usage.cacheWrite * (rates.cacheCreationInputTokenCost ?? rates.inputCostPerToken);
+  return Number.isFinite(dollars) ? Math.round(dollars * 1_000_000) : 0;
+}
+
 /**
- * A pricing function for capability attribution, using the same rates Lane A
- * uses so a skill's cost and the day's total are denominated identically.
+ * Pricing resolved for one collection run.
  *
- * Rates for every model are resolved up front rather than lazily: a lazy cache
- * would price the first record of each model at zero and quietly under-report,
- * which is worse than being slow.
+ * Provider is part of the key. An omitted, null or empty provider is the one
+ * providerless semantic key and calls the native lookup without a provider.
+ * Failed or placeholder lookups retain the existing zero-price behavior.
  */
+export class PricingContext {
+  private readonly rates = new Map<string, Rates>();
+  private readonly pending = new Map<string, Promise<void>>();
+
+  async prefetch(values: Iterable<string | PricingRef>): Promise<void> {
+    const waits: Promise<void>[] = [];
+    for (const value of values) {
+      const normalized = ref(value);
+      if (!normalized.model) continue;
+      const key = keyOf(normalized);
+      if (this.rates.has(key)) continue;
+      let pending = this.pending.get(key);
+      if (!pending) {
+        pending = (normalized.provider
+          ? lookupPricing(normalized.model, normalized.provider)
+          : lookupPricing(normalized.model)
+        )
+          .then((result) => {
+            this.rates.set(key, result.pricing as Rates);
+          })
+          .catch(() => {
+            this.rates.set(key, ZERO);
+          })
+          .finally(() => {
+            this.pending.delete(key);
+          });
+        this.pending.set(key, pending);
+      }
+      waits.push(pending);
+    }
+    await Promise.all(waits);
+  }
+
+  costMicros(value: string | PricingRef, usage: PricedUsage): number {
+    return pricedCostMicros(usage, this.rates.get(keyOf(value)) ?? ZERO);
+  }
+}
+
+/** A snake-case adapter for transcript sidecars, backed by the run's context. */
 export async function priceRecord(
   models: Iterable<string>,
-): Promise<(model: string, usage: UsageCounts) => number> {
-  const cache = new Map<string, Rates>();
-
-  await Promise.all(
-    [...new Set(models)].filter(Boolean).map(async (model) => {
-      try {
-        const r = await lookupPricing(model, "anthropic");
-        cache.set(model, r.pricing as Rates);
-      } catch {
-        // Placeholder or unpriced models cost nothing rather than failing a push.
-        cache.set(model, ZERO);
-      }
-    }),
-  );
-
-  return (model, u) => {
-    const p = cache.get(model);
-    if (!p) return 0;
-    const cost =
-      (u.input_tokens ?? 0) * p.inputCostPerToken +
-      (u.output_tokens ?? 0) * p.outputCostPerToken +
-      (u.cache_read_input_tokens ?? 0) * (p.cacheReadInputTokenCost ?? 0) +
-      (u.cache_creation_input_tokens ?? 0) * (p.cacheCreationInputTokenCost ?? 0);
-    return Math.round(cost * 1_000_000);
-  };
+  context = new PricingContext(),
+): Promise<(model: string, usage: UsageCounts, provider?: string) => number> {
+  await context.prefetch(models);
+  return (model, usage, provider) => context.costMicros({ model, provider }, {
+    input: usage.input_tokens ?? 0,
+    output: usage.output_tokens ?? 0,
+    cacheRead: usage.cache_read_input_tokens ?? 0,
+    cacheWrite: usage.cache_creation_input_tokens ?? 0,
+  });
 }

@@ -3,12 +3,13 @@ import { loadConfig, saveConfig, type KibbleConfig } from "../config.js";
 import { acquire } from "../lock.js";
 import { enforcePolicy } from "./schedule.js";
 import type { CapabilityRecord } from "../sources/capabilities.js";
-import { priceRecord } from "../sources/pricing.js";
+import { priceRecord, PricingContext } from "../sources/pricing.js";
 import { scanLocal } from "../sources/local.js";
 import { describePlans, readPlans } from "../sources/plans.js";
 import { summarizeRepos } from "../sources/repos.js";
-import { createSource, parseSourceName } from "../sources/index.js";
+import { createSource } from "../sources/index.js";
 import type { CollectResult, NormalizedDailyUsage } from "../sources/types.js";
+import { sameServerOrigin } from "../server.js";
 
 /** No request is allowed to hang the scheduled push into the next hour. */
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -37,6 +38,12 @@ function usd(micros: number): string {
   return `$${(micros / 1_000_000).toFixed(2)}`;
 }
 
+function isUtcDay(value: string | undefined): value is string {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+}
+
 /** Group rows for the human-readable summary. Never sent to the server. */
 function summarize(rows: NormalizedDailyUsage[]): string[] {
   const byAgent = new Map<string, { cost: number; tokens: number }>();
@@ -47,8 +54,7 @@ function summarize(rows: NormalizedDailyUsage[]): string[] {
       r.tokensIn +
       r.tokensOut +
       r.tokensCacheRead +
-      r.tokensCacheWrite +
-      r.tokensReasoning;
+      r.tokensCacheWrite;
     byAgent.set(r.agent, acc);
   }
   return [...byAgent.entries()]
@@ -73,7 +79,7 @@ function sessionPercentiles(result: CollectResult): string | null {
   );
 }
 
-/** A capability that is installed and has done nothing in the window. */
+/** A capability with no recorded activity in the window. */
 function isIdle(c: CapabilityRecord): boolean {
   return c.invocations === 0 && c.attributedTurns === 0;
 }
@@ -87,7 +93,9 @@ function isIdle(c: CapabilityRecord): boolean {
  */
 function resumeFrom(config: KibbleConfig): string {
   const floor = utcDay(-MAX_BACKFILL_DAYS);
-  const last = config.lastPushedThrough;
+  const last = isUtcDay(config.lastPushedThrough) && config.lastPushedThrough <= utcDay()
+    ? config.lastPushedThrough
+    : undefined;
   const wanted = last && last < utcDay(-1) ? last : utcDay(-1);
   return wanted < floor ? floor : wanted;
 }
@@ -97,7 +105,6 @@ export async function push(opts: {
   until?: string;
   dryRun?: boolean;
   server?: string;
-  source?: string;
   capabilities?: boolean;
   /** One line per run, for the hourly schedule's log. */
   quiet?: boolean;
@@ -106,11 +113,23 @@ export async function push(opts: {
   const say = opts.quiet ? () => {} : console.log;
   const stamp = () => new Date().toISOString();
   const server = opts.server ?? config.server;
+  const outstandingSince = resumeFrom(config);
   // Resume from where the server left off, so an offline day is not lost; the
   // floor is yesterday, because a push early in the UTC day would otherwise
   // silently drop the tail of the previous day's work.
-  const since = opts.since ?? resumeFrom(config);
+  const since = opts.since ?? outstandingSince;
   const until = opts.until ?? utcDay(0);
+  if (!isUtcDay(since) || !isUtcDay(until)) {
+    throw new Error("--since and --until must be valid UTC dates in YYYY-MM-DD format");
+  }
+  if (since > until) throw new Error("--since must be on or before --until");
+  if (until > utcDay()) throw new Error("--until cannot be in the future");
+  if (!opts.dryRun && !config.linkToken) {
+    throw new Error("Not linked. Run `kibble login` first.");
+  }
+  if (!opts.dryRun && !sameServerOrigin(server, config.server)) {
+    throw new Error("This credential belongs to another server. Run `kibble login --server <url>` first.");
+  }
 
   // A dry run reads and prints; it competes with nothing and takes no lock.
   const lock = opts.dryRun ? null : acquire();
@@ -129,36 +148,34 @@ export async function push(opts: {
   }
 
   async function run(): Promise<void> {
-    const source = createSource(parseSourceName(opts.source));
+    const pricing = new PricingContext();
+    const source = createSource({ pricing });
     const result = await source.collect({ since, until });
     const rows = result.daily;
-
-    if (rows.length === 0) {
-      console.log(`${opts.quiet ? `${stamp()}  ` : ""}No usage found for ${since}..${until}.`);
-      return;
-    }
-
-    const total = rows.reduce((sum, r) => sum + r.costMicros, 0);
-    const days = new Set(rows.map((r) => r.date)).size;
-
-    say(`${since}..${until}  ${rows.length} rows across ${days} day(s)  [${source.name}]`);
-    say(summarize(rows).join("\n"));
-    say(`  ${"TOTAL".padEnd(14)} ${usd(total).padStart(10)}`);
-
-    const percentiles = sessionPercentiles(result);
-    if (percentiles) say(`\n${percentiles}`);
 
     // The organization's policy, echoed at login and on every push; on until a
     // server says otherwise. Names only -- see sources/capabilities.ts.
     const wantCapabilities = opts.capabilities ?? config.capabilities ?? true;
-    const priceOf = await priceRecord(rows.map((r) => r.model));
-    // One pass over the transcripts for both sidecars -- see sources/local.ts.
-    const { repos, capabilities } = scanLocal({
+    const priceOf = await priceRecord(rows.map((r) => r.model), pricing);
+    // One pass over the transcripts for all sidecars -- see sources/local.ts.
+    const { repos, capabilities, modelActivity } = scanLocal({
       since,
       until,
       priceOf,
       capabilities: wantCapabilities,
     });
+    if (rows.length === 0 && repos.length === 0 && capabilities.length === 0 && modelActivity.length === 0) {
+      console.log(`${opts.quiet ? `${stamp()}  ` : ""}No usage found for ${since}..${until}.`);
+      return;
+    }
+
+    const total = rows.reduce((sum, r) => sum + r.costMicros, 0);
+    const days = new Set([...rows, ...repos, ...capabilities, ...modelActivity].map((r) => r.date)).size;
+    say(`${since}..${until}  ${rows.length} rows across ${days} day(s)  [${source.name}]`);
+    if (rows.length) say(summarize(rows).join("\n"));
+    say(`  ${"TOTAL".padEnd(14)} ${usd(total).padStart(10)}`);
+    const percentiles = sessionPercentiles(result);
+    if (percentiles) say(`\n${percentiles}`);
     if (repos.length > 0) say(`\n${summarizeRepos(repos).join("\n")}`);
 
     // How each agent is billed here: subscription, API key or a cloud account,
@@ -185,7 +202,7 @@ export async function push(opts: {
     if (wantCapabilities) {
       const used = capabilities.length - idle.length;
       say(
-        `\n  capabilities: ${used} used, ${idle.length} installed but never fired (names only)` +
+        `\n  capabilities: ${used} with recorded use, ${idle.length} with no recorded use (names only; Codex coverage: explicit skill selections and recorded slash commands)` +
           (resendIdle ? "" : ", unchanged since the last push and not re-sent"),
       );
     }
@@ -195,7 +212,8 @@ export async function push(opts: {
         "\nDry run -- nothing sent. Payload is counts only: date, agent, model,\n" +
           "provider, token totals, message count, cost, opaque session ids, repo and\n" +
           "branch names, per-repo activity counts (tool calls, errors, turns,\n" +
-          "edits, lines, hook failures) with tool, version and enum names, and,\n" +
+          "edits, lines, hook failures) with tool, version and enum names,\n" +
+          "per-model cost, token, session and tool-call counts, and,\n" +
           "while the organization asks for them, skill, command and MCP server\n" +
           "names with invocation counts and description sizes, and per agent\n" +
           "how this machine is billed (subscription, API key or cloud) and the\n" +
@@ -218,6 +236,7 @@ export async function push(opts: {
       sessions: result.sessions,
       capabilities: sending,
       repos,
+      modelActivity,
       plans,
     });
     const res = await postWithRetry(new URL("/api/ingest", server), config.linkToken, payload);
@@ -250,9 +269,27 @@ export async function push(opts: {
     // the scan and the request took time, and nothing here may clobber a
     // field another command changed meanwhile.
     const next: KibbleConfig = { ...loadConfig() };
-    // Only ever forward: an explicit `--until` in the past must not rewind it.
-    if (!next.lastPushedThrough || until > next.lastPushedThrough) {
+    if (
+      next.linkToken !== config.linkToken ||
+      !sameServerOrigin(next.server, config.server)
+    ) {
+      say("Link changed while this push was running; kept the new link's sync state.");
+      return;
+    }
+    // A targeted push after an outstanding gap must not move the automatic
+    // cursor past days it did not cover. Invalid or future saved cursors are
+    // discarded, and a valid cursor only moves forward.
+    const currentCursor = isUtcDay(next.lastPushedThrough) && next.lastPushedThrough <= utcDay()
+      ? next.lastPushedThrough
+      : undefined;
+    if (
+      since <= outstandingSince &&
+      until >= outstandingSince &&
+      (!currentCursor || until > currentCursor)
+    ) {
       next.lastPushedThrough = until;
+    } else if (!currentCursor) {
+      next.lastPushedThrough = undefined;
     }
     // Only when the server kept them; with the policy off it drops the section.
     if (wantCapabilities && body.collectCapabilities !== false && resendIdle) {
@@ -293,6 +330,7 @@ async function postWithRetry(url: URL, token: string, body: string): Promise<Res
         authorization: `Bearer ${token}`,
       },
       body,
+      redirect: "error",
       // A fresh signal per attempt: a timeout starts counting when it is made.
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });

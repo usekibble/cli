@@ -1,4 +1,14 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -48,23 +58,127 @@ export interface KibbleConfig {
   autoCollect?: boolean;
 }
 
+const DEFAULT_CONFIG: KibbleConfig = { server: "https://app.usekibble.com" };
+
 export function configPath(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
   return join(base, "kibble", "config.json");
 }
 
-export function loadConfig(): KibbleConfig {
+function invalid(path: string, detail: string): Error {
+  return new Error(`Invalid Kibble config at ${path}: ${detail}.`);
+}
+
+function validateConfig(value: unknown, path: string): KibbleConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalid(path, "expected a JSON object");
+  }
+  const config = value as Record<string, unknown>;
+  if (typeof config.server !== "string") {
+    throw invalid(path, 'field "server" must be a string');
+  }
   try {
-    return JSON.parse(readFileSync(configPath(), "utf8")) as KibbleConfig;
+    const server = new URL(config.server);
+    if (server.protocol !== "http:" && server.protocol !== "https:") throw new Error();
   } catch {
-    return { server: "https://app.usekibble.com" };
+    throw invalid(path, 'field "server" must be an HTTP or HTTPS URL');
+  }
+
+  for (const field of [
+    "linkToken",
+    "deviceName",
+    "email",
+    "organizationName",
+    "lastPushedThrough",
+    "capabilityDigest",
+    "capabilityDigestAt",
+  ]) {
+    if (config[field] !== undefined && typeof config[field] !== "string") {
+      throw invalid(path, `field "${field}" must be a string`);
+    }
+  }
+  if (
+    config.teamName !== undefined &&
+    config.teamName !== null &&
+    typeof config.teamName !== "string"
+  ) {
+    throw invalid(path, 'field "teamName" must be a string or null');
+  }
+  for (const field of ["capabilities", "autoCollect"]) {
+    if (config[field] !== undefined && typeof config[field] !== "boolean") {
+      throw invalid(path, `field "${field}" must be a boolean`);
+    }
+  }
+
+  return value as KibbleConfig;
+}
+
+export function loadConfig(): KibbleConfig {
+  const path = configPath();
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { ...DEFAULT_CONFIG };
+    throw new Error(`Could not read Kibble config at ${path} (${code ?? "read failed"}).`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // JSON parser messages can echo file content, including the link token.
+    throw new Error(`Kibble config at ${path} is not valid JSON.`);
+  }
+  return validateConfig(parsed, path);
+}
+
+function flushFile(path: string): void {
+  const fd = openSync(path, "r+");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function flushDirectory(path: string): void {
+  // Windows does not expose directory handles through fs.open. The atomic
+  // rename is still used there; POSIX also flushes the containing directory.
+  if (process.platform === "win32") return;
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
 export function saveConfig(config: KibbleConfig): void {
   const path = configPath();
-  mkdirSync(dirname(path), { recursive: true });
-  // 0600: the link token is a credential.
-  writeFileSync(path, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+  validateConfig(config, path);
+  const body = JSON.stringify(config, null, 2) + "\n";
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true });
+  const temporary = join(directory, `.config.${process.pid}.${randomUUID()}.tmp`);
+
+  let published = false;
+  try {
+    // The credential is private before it becomes visible at the live path.
+    writeFileSync(temporary, body, { flag: "wx", mode: 0o600 });
+    flushFile(temporary);
+    renameSync(temporary, path);
+    published = true;
+    flushDirectory(directory);
+  } finally {
+    if (!published) {
+      try {
+        unlinkSync(temporary);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+  }
 }

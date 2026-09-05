@@ -1,7 +1,7 @@
 {
   "name": "@usekibble/cli",
   "version": "0.3.0",
-  "description": "Kibble collector -- reports AI coding agent token usage. Counts only, never content.",
+  "description": "The Kibble collector: reports what Claude Code and Codex spend, per engineer, team, model and repo. Counts only, never prompts, code or paths.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepublishOnly": "pnpm build",
@@ -36,10 +36,13 @@
   "dependencies": {
     "@tokscale/cli": "4.14.0",
     "@tokscale/core": "1.4.3",
-    "commander": "^15.0.0"
+    "commander": "^15.0.0",
+    "semver": "^7.8.5",
+    "smol-toml": "^1.8.0"
   },
   "devDependencies": {
     "@types/node": "^20",
+    "@types/semver": "^7.8.0",
     "tsx": "^4.23.12",
     "typescript": "^5"
   },

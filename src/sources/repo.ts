@@ -32,23 +32,12 @@ const CONTAINERS = new Set(["apps", "packages", "services", "libs", "modules", "
 const HOME_ROOTS = new Set(["users", "home"]);
 
 /**
- * `git@github.com:owner/repo.git` or `https://host/owner/repo.git` -> `owner/repo`.
- * Any credentials in the URL are dropped with the rest of it.
- */
-export function ownerFromRemote(url: string | null | undefined): string | null {
-  const full = repoFromRemote(url, true);
-  const parts = full?.split("/") ?? [];
-  return parts.length === 2 ? (parts[0] ?? null) : null;
-}
-
-/**
- * By default returns the repo NAME only. The same checkout reaches us as
+ * Returns the repo name only. The same checkout reaches us as
  * `owner/repo` from one agent and a bare directory from another, and keying on
  * the full slug would file one repo under two identities.
  */
 export function repoFromRemote(
   url: string | null | undefined,
-  withOwner = false,
 ): string | null {
   if (!url) return null;
   const cleaned = url.trim().replace(/\.git$/, "");
@@ -63,9 +52,7 @@ export function repoFromRemote(
   if (!pathPart) return null;
   const segments = pathPart.split("/").filter(Boolean);
   if (segments.length === 0) return null;
-  // Keep at most owner/repo -- deeper paths are self-hosted group nesting.
-  const slug = segments.slice(-2).join("/");
-  return withOwner ? slug : (segments[segments.length - 1] ?? null);
+  return segments[segments.length - 1] ?? null;
 }
 
 /**

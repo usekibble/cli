@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { loadConfig, saveConfig } from "../config.js";
 import { installId } from "../device.js";
+import { sameServerOrigin } from "../server.js";
 import { enforcePolicy, installed, removeSchedule } from "./schedule.js";
 
 /**
@@ -80,6 +81,7 @@ export interface LoginOptions {
 export async function login(opts: LoginOptions): Promise<void> {
   const config = loadConfig();
   const server = opts.server ?? config.server;
+  const renewingAtSameOrigin = sameServerOrigin(server, config.server);
 
   const grant = await requestDeviceCode(server);
 
@@ -99,7 +101,7 @@ export async function login(opts: LoginOptions): Promise<void> {
     server,
     token.access_token,
     opts.device,
-    config.linkToken,
+    renewingAtSameOrigin ? config.linkToken : undefined,
   );
 
   const next = {
@@ -112,6 +114,13 @@ export async function login(opts: LoginOptions): Promise<void> {
     teamName: linked.teamName,
     autoCollect: linked.autoCollect,
     capabilities: linked.collectCapabilities ?? config.capabilities ?? true,
+    // The response has no stable member or organization id that can prove the
+    // saved cursor belongs to this identity. A successful login therefore
+    // starts synchronization again. Ingest is idempotent, while retaining a
+    // cursor could silently leave the newly linked identity without history.
+    lastPushedThrough: undefined,
+    capabilityDigest: undefined,
+    capabilityDigestAt: undefined,
   };
   saveConfig(next);
 
@@ -265,6 +274,9 @@ async function exchangeForLinkToken(
   // hardware id.
   const res = await fetch(new URL("/api/cli/link", server), {
     method: "POST",
+    // This request carries the short-lived session and may also carry the old
+    // link credential. Never replay either body through a cross-origin redirect.
+    redirect: "error",
     headers: {
       authorization: `Bearer ${accessToken}`,
       "content-type": "application/json",

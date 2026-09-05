@@ -1,5 +1,7 @@
 import { looksLikePath, repoName } from "./repo.js";
 import type { UsageCounts } from "./capabilities.js";
+import { TranscriptDeduper } from "./transcript-dedup.js";
+import { codexDuration, codexItem, codexSettings, codexTool, CodexTokenReader } from "./codex.js";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
 
 /**
@@ -80,9 +82,9 @@ export interface RepoFacetCount {
 export interface RepoActivity {
   /** Distinct session ids seen in the repo that day. */
   sessions: number;
-  /** `tool_use` blocks (Claude Code); CommandExecution + McpToolCall + FileChange items (Codex). */
+  /** `tool_use` blocks (Claude Code); classified or legacy completed tool items (Codex). */
   toolCalls: number;
-  /** `tool_result.is_error` (Claude Code); a failed CommandExecution (Codex). Conflates a rejection with a failure. */
+  /** `tool_result.is_error` (Claude Code); a failed or declined completed tool item (Codex). Conflates a rejection with a failure. */
   toolErrors: number;
   /** Tool calls that reported a duration, and their total wall clock. */
   toolTimed: number;
@@ -91,7 +93,7 @@ export interface RepoActivity {
   textBlocks: number;
   /** A `user` record with no `tool_result` block is a person typing. Codex reports it directly. */
   humanTurns: number;
-  /** Agentic turns (`turn_duration` in Claude Code, `turn_context` in Codex), their wall clock and message counts. */
+  /** Agentic turns (`turn_duration` in Claude Code, task/turn lifecycle events in Codex), their wall clock and message counts. */
   turns: number;
   turnDurationMs: number;
   turnDurationMsMax: number;
@@ -120,7 +122,7 @@ export interface RepoActivity {
   sandboxDisabled: number;
   /** API calls that errored and were retried. */
   apiErrors: number;
-  /** The context window overflowed and was compacted. Codex reports it; Claude Code has no marker. */
+  /** Recorded completed compactions, including manual compactions. */
   compactions: number;
   hookRuns: number;
   hookErrors: number;
@@ -290,17 +292,16 @@ class Acc implements RepoActivity {
  */
 export class RepoCollector {
   private readonly acc = new Map<string, Acc>();
-  /** requestId sets: one API response is written as several records. */
-  private readonly seen = new Set<string>();
-  private readonly stopSeen = new Set<string>();
+  private readonly claudeSeen = new TranscriptDeduper();
+  private readonly codexSeen = new TranscriptDeduper();
   /** `repoName()` asks the disk; a transcript repeats the same cwd thousands of times. */
   private readonly repoByCwd = new Map<string, string | null>();
-  private readonly priceOf: (model: string, usage: UsageCounts) => number;
+  private readonly priceOf: (model: string, usage: UsageCounts, provider?: string) => number;
 
   constructor(private readonly options: {
     since: string;
     until: string;
-    priceOf?: (model: string, usage: UsageCounts) => number;
+    priceOf?: (model: string, usage: UsageCounts, provider?: string) => number;
   }) {
     this.priceOf = options.priceOf ?? (() => 0);
   }
@@ -322,7 +323,7 @@ export class RepoCollector {
 
   /** Claude Code: cwd and gitBranch on every record. */
   claude(): TranscriptVisitor {
-    const { at, inRange, seen, stopSeen, repoByCwd, priceOf } = this;
+    const { at, inRange, claudeSeen, repoByCwd, priceOf } = this;
     return {
       record: (r: Rec) => {
         const date = String(r.timestamp ?? "").slice(0, 10);
@@ -341,8 +342,11 @@ export class RepoCollector {
         const a = at(date, "claude-code", repo, branch);
 
         const sessionId = str(r.sessionId);
+        const recordId = str(r.uuid);
+        if (!claudeSeen.first("record", sessionId, recordId)) return;
         if (sessionId) a.sessionIds.add(sessionId);
         const type = r.type;
+        if (type === "system" && r.subtype === "compact_boundary") a.compactions += 1;
 
         if (type === "assistant" || type === "user") {
           if (r.isSidechain === true) a.sidechainMessages += 1;
@@ -353,9 +357,11 @@ export class RepoCollector {
           // One API response is written as one record per content block, each
           // carrying the same usage: blocks are counted per record, tokens once.
           const content = Array.isArray(message.content) ? message.content : [];
-          for (const block of content) {
+          for (const [index, block] of content.entries()) {
             const b = obj(block);
             if (b.type === "tool_use") {
+              const toolId = str(b.id) ?? (recordId ? `${recordId}:${index}` : null);
+              if (!claudeSeen.first("tool", sessionId, toolId)) continue;
               a.toolCalls += 1;
               a.facet("tool", str(b.name));
             } else if (b.type === "thinking") a.thinkingBlocks += 1;
@@ -363,16 +369,13 @@ export class RepoCollector {
           }
           const requestId = String(r.requestId ?? message.id ?? "");
           const stop = str(message.stop_reason);
-          if (stop && (!requestId || !stopSeen.has(requestId))) {
-            if (requestId) stopSeen.add(requestId);
+          if (stop && claudeSeen.first("stop", sessionId, requestId || null)) {
             a.facet("stop_reason", stop);
           }
           const usage = message.usage as UsageCounts | undefined;
           if (!usage) return;
-          if (requestId) {
-            if (seen.has(requestId)) return;
-            seen.add(requestId);
-          }
+          if (num(usage.input_tokens) + num(usage.output_tokens) + num(usage.cache_read_input_tokens) + num(usage.cache_creation_input_tokens) === 0) return;
+          if (!claudeSeen.first("response", sessionId, requestId || null)) return;
           const u = obj(usage);
           a.tokensIn += num(u.input_tokens);
           a.tokensOut += num(u.output_tokens);
@@ -399,7 +402,11 @@ export class RepoCollector {
 
         if (type === "user") {
           const message = obj(r.message);
-          const content = Array.isArray(message.content) ? message.content : [];
+          const rawContent = message.content;
+          const content = Array.isArray(rawContent) ? rawContent : [];
+          const hasContent = typeof rawContent === "string"
+            ? rawContent.length > 0
+            : content.length > 0;
           let results = 0;
           for (const block of content) {
             const b = obj(block);
@@ -407,7 +414,7 @@ export class RepoCollector {
             results += 1;
             if (b.is_error === true) a.toolErrors += 1;
           }
-          if (results === 0 && r.isMeta !== true && content.length > 0) a.humanTurns += 1;
+          if (results === 0 && r.isMeta !== true && hasContent) a.humanTurns += 1;
           const result = r.toolUseResult;
           if (result && typeof result === "object" && !Array.isArray(result)) {
             const t = result as Rec;
@@ -456,15 +463,22 @@ export class RepoCollector {
     let repo: string | null = null;
     let branch: string | null = null;
     let sessionId: string | null = null;
+    let fileNumber = 0;
+    const tokens = new CodexTokenReader();
+    let model: string | null = null;
     let meta: { version: string | null; provider: string | null; entrypoint: string | null } | null = null;
     return {
-      startFile: () => {
+      startFile: (file) => {
+        fileNumber += 1;
+        tokens.startFile(file);
         repo = null;
         branch = null;
         sessionId = null;
+        model = null;
         meta = null;
       },
       record: (r: Rec) => {
+        const sample = tokens.read(r);
         const payload = obj(r.payload);
 
         if (r.type === "session_meta") {
@@ -483,9 +497,15 @@ export class RepoCollector {
           };
           return;
         }
+        const settings = codexSettings(r);
+        if (settings) {
+          model = str(settings.model) ?? model;
+          if (typeof settings.cwd === "string") repo = repoName({ cwd: settings.cwd }) ?? repo;
+        }
         if (!repo) return;
+        const dedupScope = sessionId ?? `anonymous-file:${fileNumber}`;
 
-        const date = String(r.timestamp ?? "").slice(0, 10);
+        const date = sample?.date ?? String(r.timestamp ?? "").slice(0, 10);
         if (!inRange(date)) return;
         const a = at(date, "codex", repo, branch);
         if (sessionId && !a.sessionIds.has(sessionId)) {
@@ -498,50 +518,67 @@ export class RepoCollector {
           }
         }
 
-        if (r.type === "turn_context") {
-          a.turns += 1;
-          a.facet("model", str(payload.model));
-          a.facet("effort", str(payload.effort));
-          a.facet("approval_policy", str(payload.approval_policy));
-          a.facet("sandbox_policy", str(obj(payload.sandbox_policy).type));
+        if (settings) {
+          if (!this.codexSeen.first("settings", dedupScope, str(payload.turn_id) ?? String(r.timestamp ?? ""))) return;
+          if (r.type === "turn_context" && this.codexSeen.first("turn", dedupScope, str(payload.turn_id))) a.turns += 1;
+          a.facet("model", str(settings.model));
+          a.facet("effort", str(settings.effort ?? settings.reasoning_effort));
+          a.facet("service_tier", str(settings.service_tier));
+          a.facet("approval_policy", str(settings.approval_policy));
+          a.facet("sandbox_policy", str(obj(settings.sandbox_policy).type));
+          return;
+        }
+        if (sample) {
+          const usage = sample.usage;
+          a.tokensIn += usage.input_tokens ?? 0;
+          a.tokensOut += usage.output_tokens ?? 0;
+          a.tokensCacheRead += usage.cache_read_input_tokens ?? 0;
+          a.tokensCacheWrite += usage.cache_creation_input_tokens ?? 0;
+          a.tokensReasoning += sample.reasoning;
+          if (sample.model !== "unknown") a.costMicros += this.priceOf(sample.model, usage, sample.provider);
+          a.messageCount += 1;
           return;
         }
         if (r.type !== "event_msg") return;
 
-        if (payload.type === "token_count") {
-          // Codex reports token usage on token_count events.
-          const info = obj(payload.info);
-          const last = info.last_token_usage as Record<string, number> | undefined;
-          if (!last) return;
-          const usage: UsageCounts = {
-            input_tokens: last.input_tokens ?? 0,
-            output_tokens: last.output_tokens ?? 0,
-            cache_read_input_tokens: last.cached_input_tokens ?? 0,
-            cache_creation_input_tokens: 0,
-          };
-          if (!usage.input_tokens && !usage.output_tokens) return;
-          a.tokensIn += usage.input_tokens ?? 0;
-          a.tokensOut += usage.output_tokens ?? 0;
-          a.tokensCacheRead += usage.cache_read_input_tokens ?? 0;
-          a.tokensReasoning += num(last.reasoning_output_tokens);
-          a.messageCount += 1;
+        if (["task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted"].includes(String(payload.type))) {
+          const id = str(payload.turn_id);
+          if (this.codexSeen.first("turn", dedupScope, id)) a.turns += 1;
+          if (["task_complete", "turn_complete", "turn_aborted"].includes(String(payload.type)) && this.codexSeen.first("turn-end", dedupScope, id)) {
+            const duration = Math.max(0, Math.round(num(payload.duration_ms)));
+            a.turnDurationMs += duration;
+            a.turnDurationMsMax = Math.max(a.turnDurationMsMax, duration);
+            if (payload.type === "turn_aborted") a.interrupted += 1;
+          }
+          return;
+        }
+        if (payload.type === "hook_completed") {
+          const run = obj(payload.run);
+          if (!this.codexSeen.first("hook", dedupScope, str(run.id))) return;
+          a.hookRuns += 1;
+          if (run.status === "failed" || run.status === "blocked") a.hookErrors += 1;
+          return;
+        }
+        if (payload.type === "stream_error") {
+          if (this.codexSeen.first("api-error", dedupScope, `${payload.turn_id ?? ""}:${r.timestamp ?? ""}`)) a.apiErrors += 1;
           return;
         }
 
-        if (payload.type === "turn_aborted") {
-          a.interrupted += 1;
-          return;
-        }
-
-        if (payload.type === "item_completed") {
-          // Codex routes every tool through one generic call and classifies
-          // afterwards; the classified item is the comparable unit, and the
-          // only one counted here. See the plan on why cross-agent tool counts
-          // are a claim about Codex, not a fact about the team.
-          const item = obj(payload.item);
+        // Classified and legacy completion events use the same opaque item id.
+        const item = codexItem(r);
+        if (item) {
           const kind = str(item.type);
           if (!kind) return;
+          if (!this.codexSeen.first("item", dedupScope, str(item.id))) return;
           a.facet("item", kind);
+          const tool = codexTool(item);
+          if (tool) {
+            a.toolCalls += 1;
+            a.facet("tool", str(tool));
+            if (["failed", "declined"].includes(String(item.status)) || (kind === "CommandExecution" && num(item.exit_code) !== 0)) a.toolErrors += 1;
+            const duration = codexDuration(item);
+            if (duration !== null) { a.toolTimed += 1; a.toolDurationMs += duration; }
+          }
           switch (kind) {
             case "UserMessage":
               a.humanTurns += 1;
@@ -555,24 +592,8 @@ export class RepoCollector {
             case "AgentMessage":
               a.textBlocks += 1;
               break;
-            case "CommandExecution": {
-              a.toolCalls += 1;
-              a.facet("tool", "CommandExecution");
-              if (item.status === "failed" || num(item.exit_code) !== 0) a.toolErrors += 1;
-              const d = obj(item.duration);
-              if (typeof d.secs === "number") {
-                a.toolTimed += 1;
-                a.toolDurationMs += Math.round(num(d.secs) * 1000 + num(d.nanos) / 1e6);
-              }
-              break;
-            }
-            case "McpToolCall":
-              a.toolCalls += 1;
-              a.facet("tool", `mcp__${str(item.server) ?? "unknown"}`);
-              break;
             case "FileChange": {
-              a.toolCalls += 1;
-              a.facet("tool", "FileChange");
+              if (item.status === "failed" || item.status === "declined") break;
               // `changes` is keyed by path; only the values are looked at, and
               // of each diff only the first character of each line.
               const changes = obj(item.changes);
@@ -587,10 +608,10 @@ export class RepoCollector {
               }
               break;
             }
+            case "WebSearch": a.webSearchRequests += 1; break;
             case "Extension": {
               const ext = str(item.kind);
               if (ext === "web.search") a.webSearchRequests += 1;
-              a.facet("tool", ext ? `extension:${ext}` : null);
               break;
             }
           }
@@ -629,9 +650,9 @@ export class RepoCollector {
         } as RepoUsage;
         return row;
       })
-      // A repo-day with no priced message is a directory that was opened, not
-      // worked in; the activity on it would have nothing to be a rate of.
-      .filter((r) => r.messageCount > 0)
+      // A tool can finish after midnight without another priced response.
+      // Preserve recorded activity while dropping directories merely opened.
+      .filter((r) => r.messageCount > 0 || ACTIVITY_KEYS.some((key) => r[key] > 0))
       // Belt and braces: nothing that still looks like a path may be reported,
       // as a repo, a branch, or a facet value.
       .filter((r) => r.repo && !looksLikePath(r.repo))

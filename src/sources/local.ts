@@ -1,7 +1,10 @@
 import { homedir } from "node:os";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { CapabilityCollector, type CapabilityRecord, type UsageCounts } from "./capabilities.js";
 import { RepoCollector, type RepoUsage } from "./repos.js";
+import { ModelActivityCollector, type ModelActivity } from "./model-activity.js";
+import { codexHome } from "./codex-inventory.js";
 import {
   harvestCwds,
   listJsonl,
@@ -11,27 +14,27 @@ import {
 } from "./transcripts.js";
 
 /**
- * Both sidecars, one pass over the transcripts.
+ * Transcript sidecars, one pass over the transcripts.
  *
- * `repo_daily` and `capability_daily` are cuts of the same records, so reading
- * the machine twice to produce them was work done for nothing: every transcript
- * was opened, split and JSON-parsed once per sidecar, every hour. Here the
- * Claude Code transcripts are walked once and each record is handed to both
- * collectors, and files whose mtime predates the window are not opened at all.
+ * `repo_daily`, `capability_daily`, and `model_activity_daily` are cuts of the
+ * same records. Here the Claude Code transcripts are walked once and each
+ * record is handed to the requested collectors, and files whose mtime predates
+ * the window are not opened at all.
  *
- * Codex sessions ride the same rule: one walk feeds the repo collector and the
- * capability collector's Codex visitor together.
+ * Codex sessions ride the same rule: one walk feeds every requested Codex
+ * visitor together.
  */
 export interface ScanOptions {
   since: string;
   until: string;
   home?: string;
-  priceOf?: (model: string, usage: UsageCounts) => number;
+  priceOf?: (model: string, usage: UsageCounts, provider?: string) => number;
 }
 
 export interface LocalScan {
   repos: RepoUsage[];
   capabilities: CapabilityRecord[];
+  modelActivity: ModelActivity[];
 }
 
 export function scanLocal(
@@ -43,6 +46,7 @@ export function scanLocal(
   const floor = transcriptFloor(options.since);
 
   const repoCollector = wantRepos ? new RepoCollector(options) : null;
+  const modelCollector = wantRepos ? new ModelActivityCollector(options) : null;
   const capabilityCollector = wantCapabilities
     ? new CapabilityCollector({ ...options, home })
     : null;
@@ -50,6 +54,7 @@ export function scanLocal(
   const claude = partitionByFloor(listJsonl(join(home, ".claude", "projects")), floor);
   readTranscripts(claude.recent, [
     ...(repoCollector ? [repoCollector.claude()] : []),
+    ...(modelCollector ? [modelCollector.claude()] : []),
     ...(capabilityCollector ? [capabilityCollector.visitor()] : []),
   ]);
   // The skipped files still have to answer "which checkouts have a `.claude`".
@@ -60,25 +65,33 @@ export function scanLocal(
   }
 
   if (repoCollector || capabilityCollector) {
-    const codex = partitionByFloor(listJsonl(join(home, ".codex", "sessions")), floor);
+    const codex = partitionByFloor([...listJsonl(join(codexHome(home), "sessions")), ...listJsonl(join(codexHome(home), "archived_sessions"))], floor);
     readTranscripts(codex.recent, [
       ...(repoCollector ? [repoCollector.codex()] : []),
+      ...(modelCollector ? [modelCollector.codex()] : []),
       ...(capabilityCollector ? [capabilityCollector.codexVisitor()] : []),
     ]);
+    if (capabilityCollector) {
+      const cwds = new Set<string>();
+      harvestCwds(codex.older, cwds, "codex");
+      for (const cwd of cwds) capabilityCollector.addCodexCwd(cwd);
+      // Named CLI commands have a distinct source. Never re-read transcripts to
+      // recover them, or infer them from expanded prompts or shell tool calls.
+      const path = join(codexHome(home), "history.jsonl");
+      let history;
+      try { history = statSync(path); }
+      catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("could not inspect Codex command history", { cause });
+      }
+      if (history && history.mtimeMs >= floor) {
+        readTranscripts([{ path, mtimeMs: history.mtimeMs }], [capabilityCollector.codexHistoryVisitor()]);
+      }
+    }
   }
 
   return {
     repos: repoCollector?.finish() ?? [],
+    modelActivity: modelCollector?.finish() ?? [],
     capabilities: capabilityCollector?.finish() ?? [],
   };
-}
-
-/** Repo attribution alone, for callers that do not want the capability pass. */
-export function scanRepos(options: ScanOptions): RepoUsage[] {
-  return scanLocal({ ...options, capabilities: false }).repos;
-}
-
-/** Capability usage alone. */
-export function scanCapabilities(options: ScanOptions): CapabilityRecord[] {
-  return scanLocal({ ...options, repos: false }).capabilities;
 }

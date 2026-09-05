@@ -2,6 +2,10 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
+import { TranscriptDeduper } from "./transcript-dedup.js";
+import { codexItem, codexSettings } from "./codex.js";
+import { codexRoots } from "./codex-inventory.js";
+import { codexCommandName, codexSkillSelections } from "./codex-capabilities.js";
 
 /**
  * Capability telemetry: which skills, slash commands, and MCP servers a machine
@@ -30,10 +34,14 @@ import type { Rec, TranscriptVisitor } from "./transcripts.js";
  *     stamps Claude Code puts on its own records together with that record's
  *     token usage,
  *   - the LENGTH of each installed skill's `description` frontmatter field,
- *   - the same directory-listing read of Codex's `~/.codex/skills` and
- *     `~/.codex/prompts`, and from Codex session files the SERVER NAME of each
- *     `McpToolCall` item. Codex writes no capability attribution and no
- *     structured skill invocation, so those stay zero for Codex rows.
+ *   - Codex personal/project .agents skills, CODEX_HOME skills and prompts,
+ *     system skills, and enabled plugin roots from local config and manifests
+ *     (codex-inventory.ts); from Codex session files the SERVER NAME of each
+ *     `McpToolCall` item and the NAME of structured UserInput::Skill selections,
+ *   - from Codex history.jsonl, only the bounded leading slash-command NAME,
+ *     recognized against built-ins, installed commands or /prompts:name.
+ *     Arguments and expanded prompts are never inspected. Codex capability
+ *     attribution and implicit shell-based skill reads remain unobserved.
  *
  * Bodies and descriptions are measured and discarded; only their sizes are kept.
  *
@@ -113,6 +121,62 @@ export interface Inventory {
 }
 
 /**
+ * Registers names against resolved artifacts for either agent's inventory.
+ *
+ * Name precedence stays with the first registration. A later name for the same
+ * resolved path remains in the map for invocation lookup, but is marked as an
+ * alias so the idle inventory emits the artifact once. Description sizing is
+ * cached by resolved path for the same reason.
+ */
+function artifactRegistry(): {
+  inventory: Inventory;
+  add(
+    kind: "skill" | "command",
+    name: string,
+    path: string,
+    source: CapabilitySource,
+  ): void;
+} {
+  const inventory: Inventory = {
+    skills: new Map<string, InstalledCapability>(),
+    commands: new Map<string, InstalledCapability>(),
+  };
+  const claimed = {
+    skill: new Set<string>(),
+    command: new Set<string>(),
+  };
+  const descriptions = new Map<string, number>();
+
+  return {
+    inventory,
+    add(kind, name, path, source) {
+      const entries = kind === "skill" ? inventory.skills : inventory.commands;
+      if (!name || entries.has(name)) return;
+      let realPath: string;
+      try {
+        realPath = realpathSync(path);
+      } catch {
+        return;
+      }
+      const alias = claimed[kind].has(realPath);
+      claimed[kind].add(realPath);
+      let descriptionTokens = 0;
+      if (kind === "skill") {
+        descriptionTokens = descriptions.get(realPath) ?? descriptionTokensFor(realPath);
+        descriptions.set(realPath, descriptionTokens);
+      }
+      entries.set(name, {
+        name,
+        source,
+        realPath,
+        descriptionTokens,
+        ...(alias ? { alias: true } : {}),
+      });
+    },
+  };
+}
+
+/**
  * Entries of a skill or command directory, with symlinks followed.
  *
  * `statSync` follows links on purpose. A project's `.claude/skills` is
@@ -145,7 +209,7 @@ function listEntries(dir: string, want: "skill" | "command"): { name: string; pa
     // is a namespace: `commands/frontend/component.md` is `frontend:component`,
     // never a command called `frontend`.
     if (want === "skill") {
-      if (isDir) out.push({ name, path });
+      if (isDir && (existsSync(join(path, "SKILL.md")) || existsSync(join(path, "index.md")))) out.push({ name, path });
       continue;
     }
     if (isDir) {
@@ -288,42 +352,7 @@ function projectRoots(
  * skill as not installed and gave it a description cost of zero.
  */
 export function inventory(home = homedir(), cwds: Iterable<string> = []): Inventory {
-  const skills = new Map<string, InstalledCapability>();
-  const commands = new Map<string, InstalledCapability>();
-  const described = new Map<string, number>();
-
-  // One artifact, however many names reach it. The FIRST name registered for a
-  // real path is the one reported; every later name for the same path is an
-  // alias, so `installed` still answers for it while the never-fired loop files
-  // it once. A skills directory of symlinks into a shared folder, and a plugin
-  // skill reachable both qualified and bare, both land here.
-  const claimed = new Map<Map<string, InstalledCapability>, Set<string>>();
-
-  const add = (
-    map: Map<string, InstalledCapability>,
-    name: string,
-    path: string,
-    source: CapabilitySource,
-    withDescription: boolean,
-  ) => {
-    if (!name || map.has(name)) return;
-    let realPath: string;
-    try {
-      realPath = realpathSync(path);
-    } catch {
-      return;
-    }
-    let paths = claimed.get(map);
-    if (!paths) claimed.set(map, (paths = new Set()));
-    const alias = paths.has(realPath);
-    paths.add(realPath);
-    let descriptionTokens = 0;
-    if (withDescription) {
-      descriptionTokens = described.get(realPath) ?? descriptionTokensFor(realPath);
-      described.set(realPath, descriptionTokens);
-    }
-    map.set(name, { name, source, realPath, descriptionTokens, ...(alias ? { alias: true } : {}) });
-  };
+  const registry = artifactRegistry();
 
   const roots: { dir: string; source: CapabilitySource; prefixes: string[] }[] = [
     ...projectRoots(home, cwds).map(({ dir, prefixes }) => ({
@@ -341,58 +370,34 @@ export function inventory(home = homedir(), cwds: Iterable<string> = []): Invent
     })),
   ];
   for (const { dir, source, prefixes } of roots) {
-    for (const [kind, map, described] of [
-      ["skill", skills, true],
-      ["command", commands, false],
-    ] as const) {
+    for (const kind of ["skill", "command"] as const) {
       for (const e of listEntries(join(dir, kind === "skill" ? "skills" : "commands"), kind)) {
         const names =
           source === "plugin"
             ? [...prefixes.map((p) => `${p}:${e.name}`), e.name]
             : [e.name, ...prefixes.map((p) => `${p}:${e.name}`)];
-        for (const name of names) add(map, name, e.path, source, described);
+        for (const name of names) registry.add(kind, name, e.path, source);
       }
     }
   }
-  return { skills, commands };
+  return registry.inventory;
 }
 
 /**
  * Every skill and custom prompt Codex can load on this machine.
  *
- * One root: `~/.codex/skills` for skills (the same SKILL.md shape Claude Code
- * uses, so the description sizing is shared) and `~/.codex/prompts` for custom
- * prompts, reported as commands. Codex has no plugin marketplace install
- * record and no per-checkout capability directory to walk, so there are no
- * project or plugin roots and no aliases.
+ * Personal, project, system and enabled plugin roots. Each real artifact is
+ * registered once; disabled skills and inactive plugin versions are excluded.
  */
-export function codexInventory(home = homedir()): Inventory {
-  const skills = new Map<string, InstalledCapability>();
-  const commands = new Map<string, InstalledCapability>();
-  for (const e of listEntries(join(home, ".codex", "skills"), "skill")) {
-    let realPath: string;
-    try {
-      realPath = realpathSync(e.path);
-    } catch {
-      continue;
-    }
-    skills.set(e.name, {
-      name: e.name,
-      source: "personal",
-      realPath,
-      descriptionTokens: descriptionTokensFor(realPath),
-    });
+export function codexInventory(home = homedir(), cwds: Iterable<string> = []): Inventory {
+  const registry = artifactRegistry();
+  const { roots, disabled } = codexRoots(home, cwds);
+  for (const root of roots) for (const e of listEntries(root.dir, root.kind)) {
+    try { if (disabled.has(realpathSync(e.path))) continue; } catch { continue; }
+    registry.add(root.kind, root.prefix ? `${root.prefix}:${e.name}` : e.name, e.path, root.source);
+    if (root.prefix) registry.add(root.kind, e.name, e.path, root.source);
   }
-  for (const e of listEntries(join(home, ".codex", "prompts"), "command")) {
-    let realPath: string;
-    try {
-      realPath = realpathSync(e.path);
-    } catch {
-      continue;
-    }
-    commands.set(e.name, { name: e.name, source: "personal", realPath, descriptionTokens: 0 });
-  }
-  return { skills, commands };
+  return registry.inventory;
 }
 
 interface Bucket {
@@ -425,12 +430,13 @@ function bucket(): Bucket {
  * nothing rather than guessing.
  *
  * A visitor rather than its own walk, so that one read and one parse of each
- * transcript feeds this and `repos.ts` together (`transcripts.ts`). The two
- * counters that survive a file are here; the two that must not are closed over
- * by the visitor and reset in `startFile`.
+ * transcript feeds this and `repos.ts` together (`transcripts.ts`). Invocation
+ * identities survive file boundaries so copied records stay idempotent; typed
+ * command and awaited-body state reset in `startFile`.
  */
 export class CapabilityCollector {
-  private readonly seenRequests = new Set<string>();
+  private readonly claudeSeen = new TranscriptDeduper();
+  private readonly codexSeen = new TranscriptDeduper();
   /** key: `${agent}|${date}|${kind}|${name}` */
   private readonly seen = new Map<string, Bucket>();
   /** Days each agent was active in the window; anchors that agent's idle rows. */
@@ -442,6 +448,7 @@ export class CapabilityCollector {
    * separator with a dash and cannot be decoded back.
    */
   private readonly cwds = new Set<string>();
+  private readonly codexCwds = new Set<string>();
   private readonly home: string;
   private readonly priceOf: (model: string, u: UsageCounts) => number;
 
@@ -489,8 +496,21 @@ export class CapabilityCollector {
     if (cwd) this.cwds.add(cwd);
   }
 
+  addCodexCwd(cwd: string): void {
+    if (cwd && !this.codexCwds.has(cwd)) {
+      this.codexCwds.add(cwd);
+      this.codexInventoryCache = null;
+    }
+  }
+
+  private codexInventoryCache: Inventory | null = null;
+
+  private codexInstalled(): Inventory {
+    return this.codexInventoryCache ??= codexInventory(this.home, this.codexCwds);
+  }
+
   visitor(): TranscriptVisitor {
-    const { seenRequests, active, cwds, priceOf, options } = this;
+    const { claudeSeen, active, cwds, priceOf, options } = this;
     const at = (date: string, kind: CapabilityKind, name: string) =>
       this.at("claude-code", date, kind, name);
     // The command the user most recently typed, used to tell an explicitly
@@ -514,6 +534,10 @@ export class CapabilityCollector {
         const date = String(rec.timestamp ?? "").slice(0, 10);
         if (!date || date < options.since || date > options.until) return;
 
+        const sessionId = typeof rec.sessionId === "string" ? rec.sessionId : null;
+        const recordId = typeof rec.uuid === "string" ? rec.uuid : null;
+        if (!claudeSeen.first("record", sessionId, recordId)) return;
+
         const message = (rec.message ?? {}) as Record<string, unknown>;
         const role = message.role;
         const content = message.content;
@@ -523,19 +547,16 @@ export class CapabilityCollector {
         const attributedSkill = rec.attributionSkill;
         const attributedMcp = rec.attributionMcpServer;
         const usage = message.usage as UsageCounts | undefined;
-        if (usage && (attributedSkill || attributedMcp)) {
+        const attributedTokens = usage ? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0) +
+          (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) : 0;
+        if (usage && attributedTokens > 0 && (attributedSkill || attributedMcp)) {
           const requestId = String(rec.requestId ?? message.id ?? "");
-          if (!requestId || !seenRequests.has(requestId)) {
-            if (requestId) seenRequests.add(requestId);
+          if (claudeSeen.first("attributed-response", sessionId, requestId || null)) {
             const target = attributedSkill
               ? at(date, "skill", String(attributedSkill))
               : at(date, "mcp", String(attributedMcp));
             target.attributedTurns += 1;
-            target.attributedTokens +=
-              (usage.input_tokens ?? 0) +
-              (usage.output_tokens ?? 0) +
-              (usage.cache_read_input_tokens ?? 0) +
-              (usage.cache_creation_input_tokens ?? 0);
+            target.attributedTokens += attributedTokens;
             target.attributedCostMicros += priceOf(
               String(message.model ?? ""),
               usage,
@@ -586,7 +607,7 @@ export class CapabilityCollector {
         if (role !== "assistant" || !Array.isArray(content)) return;
         active("claude-code", date);
 
-        for (const blk of content) {
+        for (const [index, blk] of content.entries()) {
           const b = blk as {
             type?: string;
             id?: string;
@@ -594,6 +615,8 @@ export class CapabilityCollector {
             input?: Record<string, unknown>;
           };
           if (b?.type !== "tool_use" || !b.name) continue;
+          const toolId = b.id ?? (recordId ? `${recordId}:${index}` : null);
+          if (!claudeSeen.first("tool", sessionId, toolId)) continue;
 
           if (b.name === "Skill") {
             // Only the skill name is kept. `args` is free text -- never read.
@@ -623,36 +646,75 @@ export class CapabilityCollector {
    * Capability usage from Codex session files, driven over the same walk that
    * feeds `repos.ts`.
    *
-   * The only structured capability fact a Codex session carries is the server
-   * name on an `McpToolCall` item. A Codex skill fires by the model reading
-   * SKILL.md with an ordinary shell command, and counting that would mean
-   * reading command lines, which are content; so Codex skill rows come from
-   * the inventory alone, `invocations` zero.
+   * UserMessage content can contain UserInput::Skill with a selected name.
+   * Count those explicit requests and MCP completions. Automatic skill reads
+   * through shell commands and capability cost attribution remain unobserved.
    */
   codexVisitor(): TranscriptVisitor {
-    const { at, active, options } = this;
+    const { at, active, codexSeen, options } = this;
+    let sessionId: string | null = null;
+    let fileNumber = 0;
     return {
+      startFile: () => { fileNumber += 1; sessionId = null; },
       record: (r: Rec) => {
+        const payload = (r.payload ?? {}) as Record<string, unknown>;
+        const cwd = codexSettings(r)?.cwd ?? (r.type === "session_meta" ? payload.cwd : undefined);
+        if (typeof cwd === "string") this.addCodexCwd(cwd);
+        if (r.type === "session_meta") {
+          sessionId = typeof payload.id === "string" ? payload.id : null;
+          return;
+        }
         const date = String(r.timestamp ?? "").slice(0, 10);
         if (!date || date < options.since || date > options.until) return;
         if (r.type !== "event_msg" && r.type !== "turn_context") return;
         active("codex", date);
         if (r.type !== "event_msg") return;
-        const payload = (r.payload ?? {}) as Record<string, unknown>;
-        if (payload.type !== "item_completed") return;
-        const item = (payload.item ?? {}) as Record<string, unknown>;
+        const item = codexItem(r);
+        if (!item) return;
+        const itemId = typeof item.id === "string" ? item.id : null;
+        if (item.type === "UserMessage") {
+          if (!codexSeen.first("skill-selection", sessionId ?? `anonymous-file:${fileNumber}`, itemId)) return;
+          for (const name of codexSkillSelections(item)) {
+            const skill = at("codex", date, "skill", name);
+            skill.invocations += 1;
+            skill.triggerTyped += 1;
+          }
+          return;
+        }
         if (item.type !== "McpToolCall") return;
+        if (!codexSeen.first("item", sessionId ?? `anonymous-file:${fileNumber}`, itemId)) return;
         const server = String(item.server ?? "").trim();
         if (server) at("codex", date, "mcp", server).invocations += 1;
       },
     };
   }
 
+  /**
+   * CLI history preserves some submitted slash commands that rollouts expand.
+   * Read this one file once, independently of transcript replay. History has no
+   * invocation id: two submissions in the same second must remain two uses.
+   */
+  codexHistoryVisitor(): TranscriptVisitor {
+    return { record: (record) => {
+      if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return;
+      const stamp = new Date(record.ts * 1000);
+      if (!Number.isFinite(stamp.valueOf())) return;
+      const date = stamp.toISOString().slice(0, 10);
+      if (date < this.options.since || date > this.options.until) return;
+      const name = codexCommandName(record.text, (candidate) => this.codexInstalled().commands.has(candidate));
+      if (!name) return;
+      const command = this.at("codex", date, "command", name);
+      command.invocations += 1;
+      command.triggerTyped += 1;
+      this.active("codex", date);
+    } };
+  }
+
   finish(): CapabilityRecord[] {
     const { home, cwds, seen, activeDates } = this;
     const inventories: Record<CapabilityAgent, Inventory> = {
       "claude-code": inventory(home, cwds),
-      codex: codexInventory(home),
+      codex: this.codexInstalled(),
     };
 
     const out: CapabilityRecord[] = [];
