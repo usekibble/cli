@@ -5,8 +5,11 @@ import { parse } from "smol-toml";
 import { compare, valid } from "semver";
 import { object } from "./codex.js";
 
-export function codexHome(home = homedir()): string {
-  return home === homedir() && process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(home, ".codex");
+export function codexHome(
+  home = homedir(),
+  env: NodeJS.ProcessEnv = home === homedir() ? process.env : {},
+): string {
+  return env.CODEX_HOME ? resolve(env.CODEX_HOME) : join(home, ".codex");
 }
 
 export interface CodexRoot {

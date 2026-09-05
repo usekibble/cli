@@ -361,7 +361,8 @@ export async function launch(): Promise<void> {
   }
   // Read-only commands, login, and dry runs neither install software nor wait
   // for the registry. Scheduled and manual pushes share this pre-collection step.
-  if (command === "push" && !args.includes("--dry-run") && process.env.KIBBLE_NO_UPDATE !== "1") await checkForUpdate();
+  const informational = args.some((arg) => ["--help", "-h", "--version", "-V"].includes(arg));
+  if (command === "push" && !informational && !args.includes("--dry-run") && process.env.KIBBLE_NO_UPDATE !== "1") await checkForUpdate();
   const originalRoot = runningPackageRoot();
   const active = readUpdateState().active;
   const root = active?.root ?? originalRoot;

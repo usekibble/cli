@@ -20,6 +20,9 @@ kibble schedule status
 `kibble login` installs a background push (hourly and at startup) via launchd,
 cron or Task Scheduler when your organization asks for it.
 
+CLI prompts, help, status messages and errors are in English regardless of
+the terminal locale.
+
 ## Automatic updates
 
 After a successful interactive login, Kibble asks once whether this machine may
@@ -79,8 +82,6 @@ kibble update enable
 ```
 
 Alternatively, after upgrading, answer the prompt on your next `kibble login`.
-Updater prompts and status messages use English or Japanese according to
-`LC_ALL`, `LC_MESSAGES`, or `LANG`.
 
 ### Approving a release for automatic updates
 
@@ -198,13 +199,39 @@ kibble usage --json           # the full answer, for scripts and agents
 kibble skill install          # teach your coding agent to analyse it
 ```
 
-`kibble usage` reads back what you can already see on your own dashboard page,
-and only that: the link token is scoped to its owner, so this can never show a
-teammate's numbers. `kibble skill install` writes a `kibble-usage` skill into
-`~/.claude/skills` (and `~/.codex/skills` when Codex is installed) so you can
-ask your coding agent things like "what did my AI usage look like this month";
-the agent runs `kibble usage --json` itself and the token never leaves the
-CLI's config.
+`kibble usage` defaults to your own usage. For team or organization reporting,
+explicitly authorize this device again, then choose the scope:
+
+```bash
+kibble login --reporting
+kibble usage --list-scopes                  # allowed scopes and team names/IDs
+kibble usage --scope self --range week      # your own usage, for every role
+kibble usage --scope team --team Engineering --range week
+kibble usage --scope team --range week      # all allowed teams combined
+kibble usage --scope org --range week       # owners only
+```
+
+Owners can read the organization or any of its teams. Managers can read only
+the teams assigned to them, or their own usage. Members can read only their own
+usage. `--team` accepts an exact name or an ID from `--list-scopes`; IDs are
+useful for scripts. Team scope without `--team` includes all allowed teams,
+excluding unassigned members. Organization scope includes unassigned members.
+Every report identifies its scope. `--json` also works with `--list-scopes`.
+
+The reporting grant is checked on the server, along with the current role and
+team assignments on every request. Existing collector tokens stay personal-only.
+An ordinary `kibble login` rotates the token and removes reporting access;
+`kibble logout` or unlinking the device revokes all its access. Selecting a scope
+does not change what the collector uploads. Team and organization reports contain
+aggregates, not a member or device roster. Deploy the server migration and routes
+before releasing this CLI; an older server cannot fulfill scoped reports.
+
+`kibble skill install` writes a `kibble-usage` skill into `~/.claude/skills`
+(and `~/.codex/skills` when Codex is installed). Ask your coding agent about
+"my AI usage this month" or "Engineering's usage this week". It discovers
+allowed scopes and runs `kibble usage --json`; credentials stay in the CLI
+config. The skill does not authorize reporting access itself. Run
+`kibble skill install` again after upgrading to refresh existing instructions.
 
 ## What leaves this machine
 

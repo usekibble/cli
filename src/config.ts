@@ -21,6 +21,8 @@ export interface KibbleConfig {
    * member, and `kibble logout` revokes exactly this one.
    */
   linkToken?: string;
+  /** Informational only: the server enforces the grant and current role. */
+  reportingAccess?: boolean;
   /** What the server calls this machine. Shown on the member's own page only. */
   deviceName?: string;
   /** Echoed back by the server at link time, for `kibble whoami`. */
@@ -105,7 +107,7 @@ function validateConfig(value: unknown, path: string): KibbleConfig {
   ) {
     throw invalid(path, 'field "teamName" must be a string or null');
   }
-  for (const field of ["capabilities", "autoCollect"]) {
+  for (const field of ["capabilities", "autoCollect", "reportingAccess"]) {
     if (config[field] !== undefined && typeof config[field] !== "boolean") {
       throw invalid(path, `field "${field}" must be a boolean`);
     }

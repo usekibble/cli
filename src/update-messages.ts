@@ -1,6 +1,4 @@
-// The standalone npm export cannot import the dashboard's next-intl runtime.
-// New updater copy ships together in English and Japanese, selected by locale.
-const en = {
+const messages = {
   prompt: "Enable automatic CLI updates? [Y/n] ",
   explanation: "Kibble will download and run new CLI versions approved by Kibble on this machine. It checks daily. Turn off anytime: kibble update disable",
   invalidAnswer: "Enter y or n, or press Enter to enable updates.",
@@ -45,52 +43,6 @@ const en = {
   leadingConfig: "Place --config-home before the command, for example: kibble --config-home /path push",
   lockPublicationFailed: "Could not publish the collector lock.",
 };
-const ja: typeof en = {
-  prompt: "CLI の自動更新を有効にしますか？ [Y/n] ",
-  explanation: "Kibble は、このマシンで Kibble が承認した新しい CLI バージョンをダウンロードして実行します。毎日確認します。いつでも無効にできます: kibble update disable",
-  invalidAnswer: "y または n を入力してください。Enter で自動更新を有効にします。",
-  enabled: "CLI の自動更新を有効にしました。",
-  disabled: "CLI の自動更新を無効にしました。現在のバージョンで収集を続けます。",
-  interrupted: "自動更新は有効になっていません。後から有効にできます: kibble update enable",
-  failed: "CLI の更新設定に失敗しました。ログインと収集設定は保存されています。再試行: kibble update enable",
-  busy: "別の CLI 更新が実行中です。完了後に再試行してください。",
-  noPrevious: "復元できる以前の CLI バージョンがありません。",
-  rolledBack: "以前の CLI バージョンを復元し、自動更新を無効にしました。",
-  updated: "CLI の更新確認が完了しました。",
-  deferred: "CLI の更新を延期しました。現在のバージョンで続行します。確認: kibble update status",
-  status: "自動更新",
-  current: "現在のバージョン",
-  previous: "以前のバージョン",
-  checked: "最終確認",
-  error: "最終エラー",
-  unknown: "なし",
-  on: "有効",
-  off: "無効",
-  unset: "未選択",
-  help: "update [enable|disable|status|rollback]: CLI の更新を管理します。サブコマンドなしで今すぐ確認します",
-  loginOption: "リンク後に CLI の自動更新を有効にする（端末なしでも使用可能）",
-  stateRead: "CLI の更新設定を読み込めませんでした。",
-  stateInvalid: "CLI の更新設定が無効です。収集設定は変更されていません。",
-  noRuntime: "使用可能な CLI がインストールされていません。",
-  npmMissing: "npm が見つかりません。npm を含む Node.js をインストールしてから kibble update enable を実行してください。",
-  installFailed: "npm による CLI のインストール準備が失敗したか、タイムアウトしました。現在のバージョンを保持しました。",
-  incompatible: "更新候補の CLI は、この Node.js バージョンまたはパッケージ識別情報と互換性がありません。",
-  healthFailed: "更新候補の CLI が起動またはネイティブパーサーの確認に失敗しました。現在のバージョンを保持しました。",
-  downloadFailed: "CLI リリースのダウンロードに失敗しました（HTTP {status}）。",
-  downloadLimit: "CLI リリースのダウンロードがサイズ制限を超えました。",
-  invalidRelease: "承認済み CLI リリースのメタデータが無効です。",
-  invalidLocation: "承認済み CLI リリースのダウンロード先が想定と異なります。",
-  newerNode: "承認済み CLI リリースには、より新しい Node.js が必要です。現在のバージョンを保持しました。",
-  integrityFailed: "CLI パッケージの整合性検証に失敗しました。",
-  buildFirst: "自動更新を有効にする前に CLI をビルドまたはアップグレードしてください。",
-  invalidFilename: "npm が無効なパッケージファイル名を返しました。",
-  prepareFirst: "kibble update enable を実行して CLI の更新を準備してください。",
-  updateFailed: "CLI の更新に失敗しました。",
-  absoluteConfig: "--config-home には絶対パスを指定してください",
-  leadingConfig: "--config-home はコマンドの前に指定してください。例: kibble --config-home /path push",
-  lockPublicationFailed: "コレクターのロックを作成できませんでした。",
-};
-export function updateText(key: keyof typeof en, values: Record<string, string | number> = {}): string {
-  const locale = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || "en";
-  return (/^ja(?:[_.-]|$)/i.test(locale) ? ja : en)[key].replace(/\{(\w+)\}/g, (match, name: string) => String(values[name] ?? match));
+export function updateText(key: keyof typeof messages, values: Record<string, string | number> = {}): string {
+  return messages[key].replace(/\{(\w+)\}/g, (match, name: string) => String(values[name] ?? match));
 }

@@ -7,7 +7,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { acquire } from "../dist/lock.js";
 import { loadConfig, saveConfig } from "../dist/config.js";
@@ -128,6 +128,39 @@ try {
   assert(existsSync(launcherPath()), "setup must provide a standalone launcher");
   assert.notEqual(baseline.root, initial.directory, "the baseline must survive removal of the global package");
   writeUpdateState({ ...readUpdateState(), enabled: true });
+
+  // Help must not download or activate executable code. Exercise the bundled
+  // launcher with consent enabled and a due check, including managed dispatch.
+  // The fixture collector only prints its version, so the real-push control
+  // cannot read this machine's transcripts or upload anything.
+  const trap = join(root, "trap-fetch.mjs");
+  const requested = join(root, "update-requested");
+  writeFileSync(trap, `import { writeFileSync } from "node:fs";
+globalThis.fetch = async () => {
+  writeFileSync(process.env.KIBBLE_UPDATE_TEST_REQUEST, "requested");
+  throw new Error("fixture network unavailable");
+};\n`);
+  const launchEnv = { ...process.env, KIBBLE_UPDATE_TEST_REQUEST: requested };
+  delete launchEnv.CI;
+  delete launchEnv.KIBBLE_NO_UPDATE;
+  const dueState = readUpdateState();
+  const filesBeforeHelp = readdirSync(updateHome()).sort();
+  for (const entry of [join(initial.directory, "dist/index.js"), launcherPath()]) {
+    for (const args of [["push", "--help"], ["push", "-h"], ["--version"], ["-V"], ["push", "--version"], ["push", "-V"]]) {
+      await run(process.execPath, ["--import", pathToFileURL(trap).href, entry, ...args], {
+        env: launchEnv, timeout: 10_000,
+      });
+      assert.equal(existsSync(requested), false, `${args.join(" ")} must not contact the registry`);
+      assert.deepEqual(readUpdateState(), dueState, `${args.join(" ")} must not change update state`);
+      assert.deepEqual(readdirSync(updateHome()).sort(), filesBeforeHelp, "help must not stage an installation");
+    }
+  }
+  await run(process.execPath, ["--import", pathToFileURL(trap).href, launcherPath(), "push"], {
+    env: launchEnv, timeout: 10_000,
+  });
+  assert.equal(existsSync(requested), true, "an ordinary due push must still check for updates");
+  assert(readUpdateState().nextCheckAt > Date.now(), "a failed update must defer the next attempt");
+  writeUpdateState(dueState);
   publish(next);
 
   process.env.CI = "true";

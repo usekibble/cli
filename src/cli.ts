@@ -10,6 +10,7 @@ import { usage } from "./commands/usage.js";
 import { loadConfig, configPath } from "./config.js";
 import { devicePath } from "./device.js";
 import { createSource } from "./sources/index.js";
+import { usageText } from "./usage-messages.js";
 import { updateText } from "./update-messages.js";
 
 const program = new Command();
@@ -38,6 +39,7 @@ program
   .option("--no-browser", "print the URL instead of opening a browser")
   .option("--device <label>", 'a name for this machine, e.g. "work laptop" (optional)')
   .option("--auto-update", updateText("loginOption"))
+  .option("--reporting", usageText("loginOption"))
   .description("authorize this machine against your Kibble account")
   .action(login);
 
@@ -61,20 +63,20 @@ program
 
 program
   .command("usage")
+  .option("--scope <scope>", usageText("scopeOption"))
+  .option("--team <name-or-id>", usageText("teamOption"))
+  .option("--list-scopes", usageText("listOption"))
   .option("--range <window>", "day, week, month (default), or 90d")
   .option("--since <date>", "inclusive UTC start date, YYYY-MM-DD (with --until)")
   .option("--until <date>", "inclusive UTC end date, YYYY-MM-DD (with --since)")
   .option("--json", "print the server's full answer as JSON, for scripts and agents")
   .option("--server <url>", "Kibble server base URL")
-  .description("read your own usage back from the dashboard (totals, trend, agents, models)")
+  .description(usageText("help"))
   .action(usage);
 
 const skill = program
   .command("skill")
-  .description(
-    "the kibble-usage skill: teach your coding agent to analyse your usage\n" +
-      "through `kibble usage --json` (your own data only, counts only)",
-  );
+  .description(usageText("skillHelp"));
 skill
   .command("install")
   .description("write SKILL.md into ~/.claude/skills (and ~/.codex/skills when Codex is installed)")

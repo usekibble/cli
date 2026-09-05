@@ -1,6 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { codexHome } from "./codex-inventory.js";
 
 /**
  * How each agent on this machine is billed: a flat subscription, metered API
@@ -22,8 +23,10 @@ import { join } from "node:path";
  *                `claude_max`, `claude_team`, `claude_enterprise` for a
  *                claude.ai login; Claude Code itself labels anything else
  *                "Claude API". `organizationRateLimitTier` is
- *                `default_claude_max_5x` / `_20x`. A Bedrock, Vertex or
- *                Foundry install has no login and is flagged by an env var.
+ *                `default_claude_max_5x` / `_20x`. Active cloud and API
+ *                credentials take precedence over that saved login. Claude
+ *                remembers an interactive API-key approval by the key's last
+ *                20 characters; the value is compared here and then dropped.
  *   Codex        `auth_mode` is `chatgpt` or `apikey`; the plan is the
  *                `chatgpt_plan_type` claim in the id_token JWT (`free`, `go`,
  *                `plus`, `pro`, `team`, `business`, `enterprise`, `edu`,
@@ -86,19 +89,63 @@ function truthy(v: unknown): boolean {
   return typeof v === "string" ? v !== "" && v !== "0" && v !== "false" : v === true || v === 1;
 }
 
+function nonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v !== "";
+}
+
+/** Claude applies its legacy global env, then user settings, after launch env. */
+function configuredEnv(
+  env: NodeJS.ProcessEnv,
+  globalEnv: Record<string, unknown>,
+  settingsEnv: Record<string, unknown>,
+  name: string,
+): unknown {
+  if (typeof settingsEnv[name] === "string") return settingsEnv[name];
+  if (typeof globalEnv[name] === "string") return globalEnv[name];
+  return env[name];
+}
+
+/** Claude persists only this suffix after an interactive API-key decision. */
+function approvedApiKey(config: Record<string, unknown> | null, key: string): boolean {
+  const responses = config?.customApiKeyResponses;
+  if (!responses || typeof responses !== "object" || Array.isArray(responses)) return false;
+  const approved = (responses as Record<string, unknown>).approved;
+  if (!Array.isArray(approved)) return false;
+  const fingerprint = key.trim().slice(-20);
+  return fingerprint !== "" && approved.some((value) => value === fingerprint);
+}
+
 /**
- * `~/.claude.json` and `~/.claude/settings.json`. Only the presence of a flag
- * or a key is tested, never its value, and none of it is returned.
+ * `~/.claude.json` and `~/.claude/settings.json`. Credential values stay in
+ * this process. An API key is compared only with Claude's saved approval
+ * suffix, and none of these values is returned.
  */
 export function claudePlan(home: string, env: NodeJS.ProcessEnv): AgentPlan | null {
   const agent = "claude-code" as const;
+  const config = readJson(join(home, ".claude.json"));
   const settings = readJson(join(home, ".claude", "settings.json"));
+  const globalEnv = (config?.env ?? {}) as Record<string, unknown>;
   const settingsEnv = (settings?.env ?? {}) as Record<string, unknown>;
-  if (CLAUDE_CLOUD_FLAGS.some((f) => truthy(env[f]) || truthy(settingsEnv[f]))) {
+  const effectiveEnv = (name: string) => configuredEnv(env, globalEnv, settingsEnv, name);
+  if (CLAUDE_CLOUD_FLAGS.some((flag) => truthy(effectiveEnv(flag)))) {
     return { agent, mode: "cloud" };
   }
 
-  const config = readJson(join(home, ".claude.json"));
+  if (nonEmptyString(effectiveEnv("ANTHROPIC_AUTH_TOKEN"))) {
+    return { agent, mode: "api" };
+  }
+
+  const apiKey = effectiveEnv("ANTHROPIC_API_KEY");
+  if (nonEmptyString(apiKey) && approvedApiKey(config, apiKey)) {
+    return { agent, mode: "api" };
+  }
+
+  // Claude uses a saved Console key and a configured helper before `/login`.
+  // Merely finding a helper is enough to establish the mode; never execute it.
+  if (nonEmptyString(config?.primaryApiKey) || nonEmptyString(settings?.apiKeyHelper)) {
+    return { agent, mode: "api" };
+  }
+
   const account = (config?.oauthAccount ?? null) as Record<string, unknown> | null;
   const orgType = typeof account?.organizationType === "string" ? account.organizationType : null;
   const tier = orgType ? CLAUDE_TIERS[orgType] : undefined;
@@ -110,13 +157,7 @@ export function claudePlan(home: string, env: NodeJS.ProcessEnv): AgentPlan | nu
     return plan;
   }
 
-  const keyed =
-    typeof env.ANTHROPIC_API_KEY === "string" ||
-    typeof env.ANTHROPIC_AUTH_TOKEN === "string" ||
-    typeof settings?.apiKeyHelper === "string" ||
-    typeof config?.primaryApiKey === "string" ||
-    orgType !== null;
-  if (keyed) return { agent, mode: "api" };
+  if (orgType !== null) return { agent, mode: "api" };
   // No login and no key: Claude Code is not set up here, so nothing to say.
   return null;
 }
@@ -160,11 +201,10 @@ function planClaim(idToken: unknown): string | null {
   }
 }
 
-/** `~/.codex/auth.json`. The tokens in it are never read past the one claim. */
+/** `$CODEX_HOME/auth.json`, defaulting to `~/.codex`. Tokens are read only for the one claim. */
 export function codexPlan(home: string, env: NodeJS.ProcessEnv): AgentPlan | null {
   const agent = "codex" as const;
-  const path = join(home, ".codex", "auth.json");
-  const auth = existsSync(path) ? readJson(path) : null;
+  const auth = readJson(join(codexHome(home, env), "auth.json"));
   const mode = typeof auth?.auth_mode === "string" ? auth.auth_mode.toLowerCase() : null;
 
   if (mode === "chatgpt") {

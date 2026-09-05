@@ -1,6 +1,6 @@
 {
   "name": "@usekibble/cli",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "The Kibble collector: reports what Claude Code and Codex spend, per engineer, team, model and repo. Counts only, never prompts, code or paths.",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-launcher.mjs",

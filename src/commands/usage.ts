@@ -1,15 +1,23 @@
 import { loadConfig } from "../config.js";
+import { usageText } from "../usage-messages.js";
 import { sameServerOrigin } from "../server.js";
 
 /** Same ceiling as push: no request may hang a scripted caller forever. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
 /**
- * What `GET /api/cli/usage` answers. Everything is the token owner's own
- * aggregates: the server scopes every figure to the one member this machine's
- * link token names, so this command can never read a colleague's data.
+ * The server authenticates the device grant and resolves current role access.
+ * Personal is the default; explicit broader scopes never fall back silently.
  */
+type ReportingScope = "self" | "team" | "org";
+interface ScopeList {
+  role: "owner" | "manager" | "member";
+  reportingEnabled: boolean;
+  scopes: ReportingScope[];
+  teams: { id: string; name: string }[];
+}
 export interface UsageReport {
+  scope?: { type: ReportingScope; teams?: { id: string; name: string }[] };
   member: { email: string };
   organization: { name: string };
   range: {
@@ -44,6 +52,8 @@ interface PeriodTotals {
   billedMicros: number;
   estimatedMicros: number;
   activeMembers: number;
+  /** Vendor analytics was reported in the window, even at zero spend. */
+  hasVendorData: boolean;
 }
 
 interface Slice {
@@ -86,12 +96,22 @@ function windowFor(range: string | undefined): { range?: string; since?: string;
 }
 
 export async function usage(opts: {
+  scope?: string;
+  team?: string;
+  listScopes?: boolean;
   range?: string;
   since?: string;
   until?: string;
   json?: boolean;
   server?: string;
 }): Promise<void> {
+  const selected = opts.scope ?? "self";
+  if (!["self", "team", "org"].includes(selected) || (opts.team !== undefined && (selected !== "team" || !opts.team.trim()))) {
+    throw new Error(usageText("invalidScope"));
+  }
+  if (opts.listScopes && [opts.scope, opts.team, opts.range, opts.since, opts.until].some((value) => value !== undefined)) {
+    throw new Error(usageText("invalidList"));
+  }
   const config = loadConfig();
   const server = opts.server ?? config.server;
   if (!config.linkToken) {
@@ -102,30 +122,54 @@ export async function usage(opts: {
   }
 
   const url = new URL("/api/cli/usage", server);
-  if (opts.since || opts.until) {
-    if (!opts.since || !opts.until) {
-      throw new Error("--since and --until go together, both YYYY-MM-DD");
-    }
-    url.searchParams.set("since", opts.since);
-    url.searchParams.set("until", opts.until);
+  if (opts.listScopes) {
+    url.searchParams.set("scopes", "1");
   } else {
-    const w = windowFor(opts.range);
-    if (w.range) url.searchParams.set("range", w.range);
-    if (w.since && w.until) {
-      url.searchParams.set("since", w.since);
-      url.searchParams.set("until", w.until);
+    if (opts.scope !== undefined) url.searchParams.set("scope", selected);
+    if (opts.team !== undefined) url.searchParams.set("team", opts.team);
+    if (opts.since || opts.until) {
+      if (!opts.since || !opts.until) {
+        throw new Error("--since and --until go together, both YYYY-MM-DD");
+      }
+      url.searchParams.set("since", opts.since);
+      url.searchParams.set("until", opts.until);
+    } else {
+      const w = windowFor(opts.range);
+      if (w.range) url.searchParams.set("range", w.range);
+      if (w.since && w.until) {
+        url.searchParams.set("since", w.since);
+        url.searchParams.set("until", w.until);
+      }
     }
   }
 
   const res = await fetch(url, {
     redirect: "error",
-    headers: { authorization: `Bearer ${config.linkToken}` },
+    headers: { authorization: `Bearer ${config.linkToken}`, "accept-language": "en" },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`usage read failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
   }
+  if (opts.listScopes) {
+    const access = (await res.json()) as ScopeList;
+    if (!Array.isArray(access.scopes) || !Array.isArray(access.teams)) throw new Error(usageText("unsupported"));
+    if (opts.json) console.log(JSON.stringify(access, null, 2));
+    else {
+      console.log(`${usageText("role")}: ${access.role}`);
+      console.log(`${usageText("available")}: ${access.scopes.join(", ")}`);
+      for (const team of access.teams) console.log(`  ${team.id}  ${team.name}`);
+      if (!access.reportingEnabled) console.log(usageText("reportingDisabled"));
+    }
+    return;
+  }
   const report = (await res.json()) as UsageReport;
+  if ((selected !== "self" && report.scope?.type !== selected)
+    || (report.scope && report.scope.type !== selected)
+    || (opts.team !== undefined && (report.scope?.teams?.length !== 1
+      || !report.scope.teams.some((team) => team.id === opts.team || team.name === opts.team)))) {
+    throw new Error(usageText("unsupported"));
+  }
 
   if (opts.json) {
     // For scripts and agents: the server's answer, verbatim.
@@ -138,6 +182,8 @@ export async function usage(opts: {
     `${report.member.email} at ${report.organization.name}  ${range.since}..${range.until}` +
       (range.clamped ? "  (cut to your plan's retention window)" : ""),
   );
+  const scopeLabel = report.scope?.type ?? "self";
+  console.log(`${usageText("scope")}: ${usageText(scopeLabel)}${scopeLabel === "team" ? ` (${report.scope?.teams?.map((team) => team.name).join(", ")})` : ""}`);
   const delta = totals.costMicros - prior.costMicros;
   console.log(
     `  total   ${usd(totals.costMicros).padStart(10)}  ${totals.tokens.toLocaleString().padStart(15)} tokens` +
@@ -145,7 +191,11 @@ export async function usage(opts: {
   );
   if (totals.billedMicros > 0) {
     console.log(
-      `  of it   ${usd(totals.billedMicros).padStart(10)} vendor-billed, ${usd(totals.estimatedMicros)} estimated (never summed twice: billed wins the day)`,
+      `  of it   ${usd(totals.billedMicros).padStart(10)} actually billed, ${usd(totals.estimatedMicros)} estimated (actual billing takes priority, then vendor analytics)`,
+    );
+  } else if (totals.hasVendorData) {
+    console.log(
+      "  basis   estimated, with vendor analytics replacing matching local estimates (not invoice charges)",
     );
   }
   for (const [title, slices] of [
@@ -163,5 +213,5 @@ export async function usage(opts: {
   if (totals.costMicros === 0) {
     console.log("\n  No usage in this window.");
   }
-  console.log("\n  Full day-by-day detail: kibble usage --json");
+  console.log(`\n  ${usageText("jsonHint")}`);
 }

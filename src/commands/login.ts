@@ -3,6 +3,7 @@ import { loadConfig, saveConfig } from "../config.js";
 import { installId } from "../device.js";
 import { sameServerOrigin } from "../server.js";
 import { enforcePolicy, installed, removeSchedule } from "./schedule.js";
+import { usageText } from "../usage-messages.js";
 import { offerAutomaticUpdates } from "../update-consent.js";
 
 /**
@@ -17,7 +18,8 @@ import { offerAutomaticUpdates } from "../update-consent.js";
  *
  * Nothing here reads a log file, and nothing here sees a password. The command
  * ends with one credential on disk: a link token that can push counts for one
- * member, and do nothing else.
+ * member and read personal usage. With --reporting, reads may also use the
+ * current dashboard role. The session is never persisted.
  */
 
 /** Public, constant. The device grant's client_id is not a secret (RFC 8628 s5.6). */
@@ -48,6 +50,7 @@ interface TokenResponse {
 
 interface LinkResponse {
   linkToken: string;
+  reportingAccess?: boolean;
   deviceName: string;
   /** This machine was already linked; its token was rotated, not duplicated. */
   renewed: boolean;
@@ -69,6 +72,8 @@ interface OAuthError {
 }
 
 export interface LoginOptions {
+  /** Explicit permission for reads within the current dashboard role. */
+  reporting?: boolean;
   /** Explicit local permission to install approved CLI updates. */
   autoUpdate?: boolean;
   server?: string;
@@ -86,7 +91,7 @@ export async function login(opts: LoginOptions): Promise<void> {
   const server = opts.server ?? config.server;
   const renewingAtSameOrigin = sameServerOrigin(server, config.server);
 
-  const grant = await requestDeviceCode(server);
+  const grant = await requestDeviceCode(server, opts.reporting === true);
 
   console.log("");
   console.log(`  Open   ${grant.verification_uri}`);
@@ -105,12 +110,14 @@ export async function login(opts: LoginOptions): Promise<void> {
     token.access_token,
     opts.device,
     renewingAtSameOrigin ? config.linkToken : undefined,
+    opts.reporting === true,
   );
 
   const next = {
     ...config,
     server,
     linkToken: linked.linkToken,
+    reportingAccess: linked.reportingAccess === true,
     deviceName: linked.deviceName,
     email: linked.email,
     organizationName: linked.organizationName,
@@ -132,6 +139,8 @@ export async function login(opts: LoginOptions): Promise<void> {
       `${linked.teamName ? ` / ${linked.teamName}` : " (no team yet)"}` +
       ` as "${linked.deviceName}".`,
   );
+
+  console.log(usageText(linked.reportingAccess ? "reportingEnabled" : "reportingDisabled"));
 
   // The organization's call, made once in Settings: with automatic collection
   // on, the schedule goes in here and nobody has to remember a second command.
@@ -183,11 +192,11 @@ export async function logout(): Promise<void> {
 
 /* -------------------------------------------------------------------------- */
 
-async function requestDeviceCode(server: string): Promise<DeviceCodeResponse> {
+async function requestDeviceCode(server: string, reporting: boolean): Promise<DeviceCodeResponse> {
   const res = await fetch(new URL("/api/auth/device/code", server), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ client_id: CLIENT_ID, scope: "usage.write" }),
+    body: JSON.stringify({ client_id: CLIENT_ID, scope: reporting ? "usage.write usage.read.reporting" : "usage.write" }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
@@ -270,6 +279,7 @@ async function exchangeForLinkToken(
   accessToken: string,
   deviceName?: string,
   previousToken?: string,
+  reporting = false,
 ): Promise<LinkResponse> {
   // Everything the server learns about this machine is in this body: a random
   // install id this machine minted for itself, a platform word, a label only
@@ -290,6 +300,7 @@ async function exchangeForLinkToken(
       platform: platformWord(),
       ...(deviceName?.trim() ? { name: deviceName.trim() } : {}),
       ...(previousToken ? { previousToken } : {}),
+      ...(reporting ? { reporting: true } : {}),
     }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });

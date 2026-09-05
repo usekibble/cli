@@ -22,7 +22,7 @@ const originalLog = console.log;
 process.env.XDG_CONFIG_HOME = root;
 console.log = () => {};
 
-async function verifyLogin(destination, linked) {
+async function verifyLogin(destination, linked, reporting = false) {
   saveConfig({
     server: "https://old.example/base",
     linkToken: "old-link-credential",
@@ -34,9 +34,11 @@ async function verifyLogin(destination, linked) {
   });
 
   let linkRequest;
+  let requestedScope;
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(input);
     if (url.pathname === "/api/auth/device/code") {
+      requestedScope = JSON.parse(init.body).scope;
       return Response.json({
         device_code: "fixture-device-code",
         user_code: "ABCD1234",
@@ -58,11 +60,12 @@ async function verifyLogin(destination, linked) {
       organizationName: linked.organizationName,
       teamName: null,
       autoCollect: false,
+      reportingAccess: linkRequest.body.reporting === true,
     });
   };
 
-  await login({ server: destination, browser: false });
-  return { request: linkRequest, config: loadConfig() };
+  await login({ server: destination, browser: false, reporting });
+  return { request: linkRequest, config: loadConfig(), requestedScope };
 }
 
 try {
@@ -71,6 +74,9 @@ try {
     email: "old@example.test",
     organizationName: "Old organization",
   });
+  assert.equal(same.request.body.reporting, undefined);
+  assert.equal(same.config.reportingAccess, false);
+  assert.equal(same.requestedScope, "usage.write");
   assert.equal(same.request.body.previousToken, "old-link-credential");
   assert.equal(same.request.init.redirect, "error");
   assert.equal(same.config.lastPushedThrough, undefined);
@@ -101,6 +107,13 @@ try {
   assert.equal(changedOrigin.config.capabilityDigestAt, undefined);
   assert.equal(readUpdateState().enabled, false, "relinking must preserve the machine's update preference");
 
+  const reporting = await verifyLogin("https://new.example", {
+    renewed: true, email: "owner@example.test", organizationName: "Reporting fixture",
+  }, true);
+  assert.equal(reporting.request.body.reporting, true);
+  assert.equal(reporting.config.reportingAccess, true);
+  assert.equal(reporting.requestedScope, "usage.write usage.read.reporting");
+
   let reads = 0;
   globalThis.fetch = async (input, init) => {
     reads++;
@@ -112,6 +125,25 @@ try {
   assert.equal(reads, 0, "foreign usage destination must not receive a request");
   await usage({ server: "https://NEW.example:443/path", json: true });
   assert.equal(reads, 1, "normalized same-origin usage remains available");
+  // An older server can silently ignore new query parameters. Never present its
+  // personal result as a successful team/org report or a scope catalog.
+  await assert.rejects(usage({ scope: "team", json: true }));
+  await assert.rejects(usage({ scope: "org", json: true }));
+  await assert.rejects(usage({ listScopes: true, json: true }));
+  const beforeInvalid = reads;
+  await assert.rejects(usage({ scope: "self", team: "Engineering", json: true }));
+  await assert.rejects(usage({ listScopes: true, scope: "org", json: true }));
+  assert.equal(reads, beforeInvalid, "invalid scope combinations never send a request");
+  globalThis.fetch = async (input) => {
+    const url = new URL(input);
+    assert.equal(url.searchParams.get("scope"), "team");
+    assert.equal(url.searchParams.get("team"), "Engineering & Platform");
+    assert.equal(url.searchParams.get("range"), "7d");
+    return Response.json({ scope: { type: "team", teams: [{ id: "allowed-id", name: "Engineering & Platform" }] } });
+  };
+  await usage({ scope: "team", team: "Engineering & Platform", range: "week", json: true });
+  globalThis.fetch = async () => Response.json({ scope: { type: "team", teams: [{ id: "wrong", name: "Other" }] } });
+  await assert.rejects(usage({ scope: "team", team: "Engineering", json: true }), /requested reporting scope/);
 } finally {
   globalThis.fetch = originalFetch;
   console.log = originalLog;

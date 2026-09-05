@@ -9,6 +9,7 @@ await import("./verify-repos.mjs");
 await import("./verify-transcripts.mjs");
 await import("./verify-login.mjs");
 await import("./verify-config.mjs");
+await import("./verify-plans.mjs");
 await import("./verify-lock.mjs");
 await import("./verify-schedule.mjs");
 await import("./verify-updates.mjs");
@@ -109,4 +110,3 @@ async function verifyHybridBoundary() {
 }
 
 await verifyHybridBoundary();
-
