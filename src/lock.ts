@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   lstatSync,
   mkdirSync,
@@ -11,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { configPath } from "./config.js";
+import { updateText } from "./update-messages.js";
 
 /**
  * One push at a time on this machine.
@@ -173,6 +175,26 @@ function removePrepared(path: string, marker: string): void {
   }
 }
 
+function publish(prepared: string, path: string): void {
+  if (process.platform !== "win32") {
+    renameSync(prepared, path);
+    return;
+  }
+  // Windows rename can replace an existing regular file with a directory. That
+  // would overwrite a legacy collector's live lock. Directory.Move uses a move
+  // without replacement, atomically refusing every existing destination.
+  // The script is constant; paths are environment data, never PowerShell code.
+  const powershell = join(process.env.SystemRoot || "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe");
+  const moved = spawnSync(powershell, [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "$ErrorActionPreference = 'Stop'; [System.IO.Directory]::Move($env:KIBBLE_LOCK_FROM, $env:KIBBLE_LOCK_TO)",
+  ], {
+    env: { ...process.env, KIBBLE_LOCK_FROM: prepared, KIBBLE_LOCK_TO: path },
+    stdio: "ignore", windowsHide: true, timeout: 30_000,
+  });
+  if (moved.status !== 0) throw new Error(updateText("lockPublicationFailed"));
+}
+
 /**
  * Take the lock, or report who has it.
  *
@@ -198,7 +220,7 @@ export function acquire(path = lockPath()): { release: () => void } | { busy: nu
       try {
         // The source is already complete and nonempty. Existing nonempty lock
         // directories refuse replacement on every supported platform.
-        renameSync(prepared, path);
+        publish(prepared, path);
       } catch (err) {
         const current = observe(path);
         if (!current) throw err;

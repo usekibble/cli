@@ -145,6 +145,10 @@ try {
   assert("busy" in acquire(), "the replacement must still exclude another push");
   replacement.release();
 
+  writeFileSync(lockPath(), JSON.stringify({ pid: process.pid, startedAt: Date.now() - 60_000 }));
+  assert("busy" in acquire(), "an upgrade must preserve a live legacy collector's file lock");
+  rmSync(lockPath());
+
   writeFileSync(lockPath(), "");
   assert("busy" in acquire(), "a freshly visible legacy file must be treated as publication in progress");
   const past = new Date(Date.now() - 60_000);

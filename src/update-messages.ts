@@ -43,6 +43,7 @@ const en = {
   updateFailed: "CLI update failed.",
   absoluteConfig: "--config-home must be an absolute path",
   leadingConfig: "Place --config-home before the command, for example: kibble --config-home /path push",
+  lockPublicationFailed: "Could not publish the collector lock.",
 };
 const ja: typeof en = {
   prompt: "CLI の自動更新を有効にしますか？ [Y/n] ",
@@ -87,6 +88,7 @@ const ja: typeof en = {
   updateFailed: "CLI の更新に失敗しました。",
   absoluteConfig: "--config-home には絶対パスを指定してください",
   leadingConfig: "--config-home はコマンドの前に指定してください。例: kibble --config-home /path push",
+  lockPublicationFailed: "コレクターのロックを作成できませんでした。",
 };
 export function updateText(key: keyof typeof en, values: Record<string, string | number> = {}): string {
   const locale = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || "en";
