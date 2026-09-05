@@ -20,6 +20,79 @@ kibble schedule status
 `kibble login` installs a background push (hourly and at startup) via launchd,
 cron or Task Scheduler when your organization asks for it.
 
+## Automatic updates
+
+After a successful interactive login, Kibble asks once whether this machine may
+download and run new CLI versions approved by Kibble. Submit `y` or press Enter
+to enable updates, or `n` to keep the current version. Closing the prompt or
+pressing Ctrl-C does not enable updates. Your login and collection still work.
+The saved choice survives re-login and logout, and is independent of your
+organization's automatic collection policy.
+
+For noninteractive setup, consent must be explicit:
+
+```
+kibble login --auto-update
+```
+
+```
+kibble update                 # check for an approved update now
+kibble update status          # preference, versions, last check and last error
+kibble update disable         # keep collecting with the current version
+kibble update enable          # opt in, or retry setup
+kibble update rollback        # restore the previous version and disable updates
+```
+
+Enabling prepares a private installation beside your config, verifies startup
+and both native parsers without reading transcripts, and moves any existing
+background schedule to a stable launcher. It uses npm without install scripts
+and never requests administrator access. Setup needs npm and network access to
+install dependencies. If setup fails, your original installation stays available.
+
+Before a push, the launcher checks npm's `auto` release tag at most once per
+24–30 hours. The extra delay spreads checks across machines. Checks run even if
+collection is failing or there is no usage. A release is installed in a separate
+directory and activated only after package integrity, Node compatibility and
+startup checks pass. Registry and installation failures keep the current version
+running. An already-running push keeps its original code and lock. Rollback
+changes the active executable, never your link token or synchronization state.
+Old runtime directories are retained so running processes can finish safely.
+Production dependencies are pinned to the versions verified for the release.
+
+Without a scheduled push, automatic checks happen when you next run `kibble push`.
+Read-only commands and dry runs do not check for updates. CI and source checkouts
+use their own installed version. For an explicitly pinned or company-managed
+installation, set `KIBBLE_NO_UPDATE=1` to use that installed version and skip
+automatic checks without changing the saved preference. Explicit `update`
+commands and `login --auto-update` still perform the action you requested.
+
+Updates run with the invoking user's permissions. Integrity verification detects
+corrupt or substituted downloads; it does not protect against a compromised
+publisher. Leave updates disabled if your company requires centrally deployed
+software. Kibble never accepts an executable or update URL from the ingest server.
+
+Existing versions without the updater need one manual upgrade:
+
+```
+npm install -g @usekibble/cli@latest
+kibble update enable
+```
+
+Alternatively, after upgrading, answer the prompt on your next `kibble login`.
+Updater prompts and status messages use English or Japanese according to
+`LC_ALL`, `LC_MESSAGES`, or `LANG`.
+
+### Approving a release for automatic updates
+
+Publishing a release does not automatically approve it for existing machines.
+After the collector checks and platform validation pass, promote its exact
+version with `npm dist-tag add @usekibble/cli@<version> auto`. Until that tag exists,
+checks report the unavailable release and collection continues. Prereleases and
+automatic downgrades are rejected. A newer release must keep the launcher state
+format, `dist/index.js`, `dist/cli.js`, and the transcript-free `dist/health.js`
+contract compatible. The bundled bootstrap retains recovery commands, while
+ordinary runs load the active release's updater before collection.
+
 ## Collection and recovery
 
 Every push automatically collects all supported local agents. The local adapter
@@ -50,6 +123,21 @@ Choose a window containing usage. The check runs synthetic collection and
 recovery fixtures and compares the default collector against raw
 Claude totals. An empty window or a parser outside the accuracy tolerance
 fails the check. It does not establish every agent's transcript accuracy.
+
+## Cross-platform CI
+
+The public repository runs `CLI checks` on pull requests and pushes to main,
+using standard Windows, Linux and macOS runners with Node 20, 22 and 24. It
+builds the standalone package, typechecks it, runs the synthetic regression
+suite, and tests native parsers, managed installation and each real OS scheduler.
+CI has read-only repository permissions and does not publish to npm.
+
+After `npm run build`, `npm run verify:fixtures` runs the shared synthetic
+suite without personal transcripts. `npm run verify:platform` is restricted to
+disposable GitHub runners because it creates and removes real OS jobs. The local
+`verify` command still runs those same synthetic fixtures before comparing the
+collector against your raw Claude transcripts. An empty transcript window fails;
+CI passing does not substitute for that accuracy check after parser changes.
 
 ## Claude Code and Codex metric coverage
 

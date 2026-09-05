@@ -1,8 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { configPath, loadConfig, saveConfig, type KibbleConfig } from "../config.js";
+import { managedLauncher } from "../update-state.js";
 
 /**
  * `kibble schedule` -- run `kibble push` every hour without a human at the
@@ -86,7 +87,7 @@ function sweepLegacy(): void {
  * the TypeScript source, which node cannot run on its own, so refuse.
  */
 function pushCommand(): { node: string; script: string; args: string[] } {
-  const script = resolve(process.argv[1] ?? "");
+  const script = managedLauncher() ?? resolve(process.argv[1] ?? "");
   if (!script || !existsSync(script)) {
     throw new Error("could not locate the kibble entry script to schedule");
   }
@@ -143,8 +144,7 @@ export function installed(): boolean {
 }
 
 /** Register the hourly and at-startup push. Returns the command it registered. */
-function register(): { cmd: ReturnType<typeof pushCommand>; log: string } {
-  const cmd = pushCommand();
+function register(cmd = pushCommand()): { cmd: ReturnType<typeof pushCommand>; log: string } {
   const log = logPath();
   mkdirSync(dirname(log), { recursive: true });
   // Before adding the new one, so an upgraded machine ends with one schedule.
@@ -164,6 +164,13 @@ function register(): { cmd: ReturnType<typeof pushCommand>; log: string } {
       throw new Error(`no scheduler support for platform "${process.platform}"`);
   }
   return { cmd, log };
+}
+
+/** Keep the old command available until a managed-launcher migration succeeds. */
+export function preserveSchedule(): (() => void) | undefined {
+  if (!installed()) return;
+  const original = pushCommand();
+  return () => { register(original); };
 }
 
 /**
@@ -423,7 +430,7 @@ function uninstallCron(): boolean {
 
 function schtasksCommand(cmd: ReturnType<typeof pushCommand>, log: string): string {
   const inner = [cmd.node, cmd.script, ...cmd.args].map((a) => `"${a}"`).join(" ");
-  return `cmd /c ${inner} >> "${log}" 2>&1`;
+  return `cmd /d /s /c "${inner} >> "${log}" 2>&1"`;
 }
 
 function decodeXml(s: string): string {
@@ -468,21 +475,36 @@ function schtasksInstalled(cmd: ReturnType<typeof pushCommand>, log: string): bo
 
 function installSchtasks(cmd: ReturnType<typeof pushCommand>, log: string): void {
   const tr = schtasksCommand(cmd, log);
-  // Two tasks: one hourly, one when the person logs on. A per-user ONLOGON
-  // task needs no elevation, unlike ONSTART.
-  for (const [name, schedule] of [
-    [LABEL, "HOURLY"],
-    [BOOT_LABEL, "ONLOGON"],
-  ] as const) {
-    const res = spawnSync(
-      "schtasks",
-      ["/Create", "/F", "/SC", schedule, "/TN", name, "/TR", tr],
-      { encoding: "utf8" },
-    );
-    if (res.status !== 0) {
-      throw new Error(`schtasks /Create failed: ${(res.stderr || res.stdout).trim()}`);
+  const user = xml(userInfo().username);
+  // XML avoids schtasks /TR's 261-character limit for managed install paths.
+  // InteractiveToken uses the current user's session without a stored password.
+  const temp = mkdtempSync(join(tmpdir(), "kibble-task-"));
+  try {
+    for (const [name, schedule] of [
+      [LABEL, "HOURLY"],
+      [BOOT_LABEL, "ONLOGON"],
+    ] as const) {
+      const trigger = schedule === "HOURLY"
+        ? `<TimeTrigger><Repetition><Interval>PT1H</Interval></Repetition><StartBoundary>${new Date(Date.now() + INTERVAL_SECONDS * 1000).toISOString()}</StartBoundary><Enabled>true</Enabled></TimeTrigger>`
+        : `<LogonTrigger><Enabled>true</Enabled><UserId>${user}</UserId></LogonTrigger>`;
+      const path = join(temp, `${name}.xml`);
+      writeFileSync(path, `\uFEFF<?xml version="1.0" encoding="UTF-16"?>
+  <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+    <Triggers>${trigger}</Triggers>
+    <Principals><Principal id="User"><UserId>${user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+    <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT30M</ExecutionTimeLimit></Settings>
+    <Actions Context="User"><Exec><Command>cmd.exe</Command><Arguments>${xml(tr.slice(4))}</Arguments></Exec></Actions>
+  </Task>`, { encoding: "utf16le", mode: 0o600 });
+      const res = spawnSync(
+        "schtasks",
+        ["/Create", "/F", "/TN", name, "/XML", path],
+        { encoding: "utf8" },
+      );
+      if (res.status !== 0) {
+        throw new Error(`schtasks /Create failed: ${(res.stderr || res.stdout).trim()}`);
+      }
     }
-  }
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 
 function uninstallSchtasks(): boolean {

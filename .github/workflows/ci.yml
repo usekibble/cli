@@ -1,0 +1,40 @@
+name: CLI checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install the standalone CLI dependencies
+        run: npm install --ignore-scripts --engine-strict --no-audit --no-fund
+      - run: npm run build
+      - run: npm run typecheck
+      - name: Collection, consent, update and recovery fixtures
+        run: npm run verify:fixtures
+      - name: Native parsers, managed installation and real OS scheduler
+        run: npm run verify:platform

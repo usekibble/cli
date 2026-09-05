@@ -6,6 +6,7 @@ import { login } from "../dist/commands/login.js";
 import { usage } from "../dist/commands/usage.js";
 import { loadConfig, saveConfig } from "../dist/config.js";
 import { sameServerOrigin } from "../dist/server.js";
+import { readUpdateState, writeUpdateState } from "../dist/update-state.js";
 
 assert.equal(
   sameServerOrigin("https://EXAMPLE.test:443/old", "https://example.test/new"),
@@ -75,6 +76,9 @@ try {
   assert.equal(same.config.lastPushedThrough, undefined);
   assert.equal(same.config.capabilityDigest, undefined);
   assert.equal(same.config.capabilityDigestAt, undefined);
+  assert.equal(readUpdateState().enabled, undefined, "noninteractive login must not enable CLI updates");
+
+  writeUpdateState({ enabled: false });
 
   const changedIdentity = await verifyLogin("https://old.example/new-base", {
     renewed: true,
@@ -95,6 +99,7 @@ try {
   assert.equal(changedOrigin.config.lastPushedThrough, undefined);
   assert.equal(changedOrigin.config.capabilityDigest, undefined);
   assert.equal(changedOrigin.config.capabilityDigestAt, undefined);
+  assert.equal(readUpdateState().enabled, false, "relinking must preserve the machine's update preference");
 
   let reads = 0;
   globalThis.fetch = async (input, init) => {
