@@ -123,7 +123,7 @@ childProcess.spawnSync = (command, args = []) => {
     }
     if (args[0] === "/Create") {
       taskCreates += 1;
-      const document = readFileSync(args[args.indexOf("/XML") + 1], "utf8");
+      const document = readFileSync(args[args.indexOf("/XML") + 1], "utf16le");
       const argumentsText = /<Arguments>([\s\S]*?)<\/Arguments>/.exec(document)[1]
         .replace(/&quot;/g, '"').replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
       tasks.set(name, {

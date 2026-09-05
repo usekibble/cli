@@ -488,13 +488,13 @@ function installSchtasks(cmd: ReturnType<typeof pushCommand>, log: string): void
         ? `<TimeTrigger><Repetition><Interval>PT1H</Interval></Repetition><StartBoundary>${new Date(Date.now() + INTERVAL_SECONDS * 1000).toISOString()}</StartBoundary><Enabled>true</Enabled></TimeTrigger>`
         : `<LogonTrigger><Enabled>true</Enabled><UserId>${user}</UserId></LogonTrigger>`;
       const path = join(temp, `${name}.xml`);
-      writeFileSync(path, `<?xml version="1.0" encoding="UTF-8"?>
+      writeFileSync(path, `\uFEFF<?xml version="1.0" encoding="UTF-16"?>
   <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
     <Triggers>${trigger}</Triggers>
     <Principals><Principal id="User"><UserId>${user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
     <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT30M</ExecutionTimeLimit></Settings>
     <Actions Context="User"><Exec><Command>cmd.exe</Command><Arguments>${xml(tr.slice(4))}</Arguments></Exec></Actions>
-  </Task>`, { mode: 0o600 });
+  </Task>`, { encoding: "utf16le", mode: 0o600 });
       const res = spawnSync(
         "schtasks",
         ["/Create", "/F", "/TN", name, "/XML", path],
