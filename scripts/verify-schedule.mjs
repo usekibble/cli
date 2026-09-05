@@ -123,9 +123,12 @@ childProcess.spawnSync = (command, args = []) => {
     }
     if (args[0] === "/Create") {
       taskCreates += 1;
+      const document = readFileSync(args[args.indexOf("/XML") + 1], "utf8");
+      const argumentsText = /<Arguments>([\s\S]*?)<\/Arguments>/.exec(document)[1]
+        .replace(/&quot;/g, '"').replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
       tasks.set(name, {
-        schedule: args[args.indexOf("/SC") + 1],
-        command: args[args.indexOf("/TR") + 1],
+        schedule: document.includes("<LogonTrigger>") ? "ONLOGON" : "HOURLY",
+        command: `cmd ${argumentsText}`,
       });
       return { status: 0, stdout: "", stderr: "" };
     }

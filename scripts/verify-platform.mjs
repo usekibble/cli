@@ -63,6 +63,16 @@ try {
   assert(registration.includes("launcher.mjs"), "the scheduler must use the stable launcher");
   assert(registration.includes("--config-home"), "the scheduler must pin the configuration home");
   assert(registration.includes(configHome), "the scheduler must preserve paths containing spaces");
+  if (process.platform === "win32") {
+    success("schtasks", ["/Run", "/TN", "com.usekibble.push"]);
+    const log = join(directory, "push.log");
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline && (!existsSync(log) || !readFileSync(log, "utf8").includes("No usage found"))) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    assert.match(existsSync(log) ? readFileSync(log, "utf8") : "", /No usage found/,
+      "Task Scheduler must execute the managed launcher and write its log");
+  }
   console.log(`OK  real ${process.platform} scheduler registration`);
 } finally {
   try {
