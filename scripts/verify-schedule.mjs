@@ -140,6 +140,8 @@ syncBuiltinESMExports();
 
 try {
   const { saveConfig } = await import("../dist/config.js");
+  const { atomicWrite, launcherPath, readUpdateState, writeUpdateState } = await import("../dist/update-state.js");
+  const { setupUpdates } = await import("../dist/updates.js");
   const { enforcePolicy, installed, scheduleInstall } = await import("../dist/commands/schedule.js");
   const config = {
     server: "https://fixture.example",
@@ -219,6 +221,31 @@ try {
     assert.equal(sourceMessages.length, 1);
     assert.match(sourceMessages[0], /scheduling failed: refusing to schedule the TypeScript source/);
     process.argv = [process.execPath, builtEntry];
+
+    // Opting in moves each scheduler to the stable launcher, retaining the
+    // same config home and push arguments even when updates are later disabled.
+    atomicWrite(launcherPath(), "// fixture launcher\n");
+    writeUpdateState({ enabled: false, active: { root: join(root, "runtime"), version: "0.4.0" } });
+    for (const platform of ["darwin", "linux", "win32"]) {
+      Object.defineProperty(process, "platform", { value: platform, configurable: true });
+      resetScheduler();
+      await scheduleInstall();
+      assert(registrationText(platform).includes(launcherPath()), `${platform} must run the managed launcher`);
+      assert.equal(installed(), true);
+    }
+    writeUpdateState({});
+
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    resetScheduler();
+    await scheduleInstall();
+    const oldRegistration = registrationText("darwin");
+    bootstrapFailures = 1;
+    await assert.rejects(setupUpdates(true, async () => {
+      writeUpdateState({ active: { root: join(root, "candidate"), version: "0.4.0" } });
+    }), /injected bootstrap failure/);
+    assert.equal(readUpdateState().active, undefined, "failed migration must restore the original runtime selection");
+    assert.equal(installed(), true, "failed migration must restore the previous scheduled command");
+    assert.equal(registrationText("darwin"), oldRegistration);
   } finally {
     console.log = originalLog;
   }

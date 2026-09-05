@@ -3,6 +3,7 @@ import { loadConfig, saveConfig } from "../config.js";
 import { installId } from "../device.js";
 import { sameServerOrigin } from "../server.js";
 import { enforcePolicy, installed, removeSchedule } from "./schedule.js";
+import { offerAutomaticUpdates } from "../update-consent.js";
 
 /**
  * `kibble login` -- OAuth 2.0 device authorization grant (RFC 8628).
@@ -68,6 +69,8 @@ interface OAuthError {
 }
 
 export interface LoginOptions {
+  /** Explicit local permission to install approved CLI updates. */
+  autoUpdate?: boolean;
   server?: string;
   /** A label for this machine, e.g. "work laptop". Optional; nothing is inferred. */
   device?: string;
@@ -140,6 +143,7 @@ export async function login(opts: LoginOptions): Promise<void> {
   } else {
     console.log("Run `kibble push` to send today's usage, or `kibble schedule install` to push every hour.");
   }
+  await offerAutomaticUpdates(opts.autoUpdate);
 }
 
 /**

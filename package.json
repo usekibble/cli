@@ -3,11 +3,13 @@
   "version": "0.4.0",
   "description": "The Kibble collector: reports what Claude Code and Codex spend, per engineer, team, model and repo. Counts only, never prompts, code or paths.",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-launcher.mjs",
     "prepublishOnly": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts",
-    "verify": "pnpm build && node scripts/verify-accuracy.mjs"
+    "verify": "pnpm build && node scripts/verify-accuracy.mjs",
+    "verify:fixtures": "node scripts/verify-fixtures.mjs",
+    "verify:platform": "node scripts/verify-platform.mjs"
   },
   "keywords": [
     "claude-code",
@@ -36,13 +38,14 @@
   "dependencies": {
     "@tokscale/cli": "4.14.0",
     "@tokscale/core": "1.4.3",
-    "commander": "^15.0.0",
-    "semver": "^7.8.5",
-    "smol-toml": "^1.8.0"
+    "commander": "14.0.3",
+    "semver": "7.8.5",
+    "smol-toml": "1.8.0"
   },
   "devDependencies": {
     "@types/node": "^20",
     "@types/semver": "^7.8.0",
+    "esbuild": "^0.25.12",
     "tsx": "^4.23.12",
     "typescript": "^5"
   },

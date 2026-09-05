@@ -180,8 +180,7 @@ function removePrepared(path: string, marker: string): void {
  * milliseconds of the run that holds it, so the caller can say something
  * useful instead of just declining.
  */
-export function acquire(): { release: () => void } | { busy: number } {
-  const path = lockPath();
+export function acquire(path = lockPath()): { release: () => void } | { busy: number } {
   mkdirSync(dirname(path), { recursive: true });
 
   const mine: Required<Held> = {

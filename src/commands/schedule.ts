@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { configPath, loadConfig, saveConfig, type KibbleConfig } from "../config.js";
+import { managedLauncher } from "../update-state.js";
 
 /**
  * `kibble schedule` -- run `kibble push` every hour without a human at the
@@ -86,7 +87,7 @@ function sweepLegacy(): void {
  * the TypeScript source, which node cannot run on its own, so refuse.
  */
 function pushCommand(): { node: string; script: string; args: string[] } {
-  const script = resolve(process.argv[1] ?? "");
+  const script = managedLauncher() ?? resolve(process.argv[1] ?? "");
   if (!script || !existsSync(script)) {
     throw new Error("could not locate the kibble entry script to schedule");
   }
@@ -143,8 +144,7 @@ export function installed(): boolean {
 }
 
 /** Register the hourly and at-startup push. Returns the command it registered. */
-function register(): { cmd: ReturnType<typeof pushCommand>; log: string } {
-  const cmd = pushCommand();
+function register(cmd = pushCommand()): { cmd: ReturnType<typeof pushCommand>; log: string } {
   const log = logPath();
   mkdirSync(dirname(log), { recursive: true });
   // Before adding the new one, so an upgraded machine ends with one schedule.
@@ -164,6 +164,13 @@ function register(): { cmd: ReturnType<typeof pushCommand>; log: string } {
       throw new Error(`no scheduler support for platform "${process.platform}"`);
   }
   return { cmd, log };
+}
+
+/** Keep the old command available until a managed-launcher migration succeeds. */
+export function preserveSchedule(): (() => void) | undefined {
+  if (!installed()) return;
+  const original = pushCommand();
+  return () => { register(original); };
 }
 
 /**
