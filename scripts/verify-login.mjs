@@ -2,11 +2,38 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { login } from "../dist/commands/login.js";
+import { register } from "node:module";
 import { usage } from "../dist/commands/usage.js";
 import { loadConfig, saveConfig } from "../dist/config.js";
 import { sameServerOrigin } from "../dist/server.js";
 import { readUpdateState, writeUpdateState } from "../dist/update-state.js";
+
+// Exercise the production login while isolating real collection and OS jobs.
+const dist = new URL("../dist/", import.meta.url).href;
+const stubs = {
+  [`${dist}commands/push.js`]: "export const push = () => globalThis.__loginFixture.push();",
+  [`${dist}commands/schedule.js`]: "export const installed = () => false; export const preserveSchedule = () => {}; export const scheduleInstall = () => {}; export const removeSchedule = () => {}; export const enforcePolicy = () => globalThis.__loginFixture.scheduled.push(globalThis.__loginFixture.completed);",
+};
+register(`data:text/javascript,${encodeURIComponent(`
+  const stubs = new Map(Object.entries(${JSON.stringify(stubs)}));
+  export async function load(url, context, nextLoad) {
+    if (stubs.has(url)) return { format: "module", source: stubs.get(url), shortCircuit: true };
+    return nextLoad(url, context);
+  }
+`)}`, import.meta.url);
+const { login } = await import("../dist/commands/login.js");
+const fixture = globalThis.__loginFixture = {
+  calls: 0, completed: false, fail: false, result: "pushed", scheduled: [],
+  async push() {
+    this.calls++;
+    assert.equal(this.scheduled.length, 0, "first upload starts before any startup job");
+    assert.equal(loadConfig().linkToken, "new-link-credential");
+    this.completed = true;
+    if (this.fail) throw new Error("fixture collection failure");
+    if (this.result === "pushed") saveConfig({ ...loadConfig(), lastPushedThrough: "2026-09-05" });
+    return this.result;
+  },
+};
 
 assert.equal(
   sameServerOrigin("https://EXAMPLE.test:443/old", "https://example.test/new"),
@@ -59,7 +86,7 @@ async function verifyLogin(destination, linked, reporting = false) {
       email: linked.email,
       organizationName: linked.organizationName,
       teamName: null,
-      autoCollect: false,
+      autoCollect: linked.autoCollect ?? false,
       reportingAccess: linkRequest.body.reporting === true,
     });
   };
@@ -114,6 +141,37 @@ try {
   assert.equal(reporting.config.reportingAccess, true);
   assert.equal(reporting.requestedScope, "usage.write usage.read.reporting");
 
+  assert.equal(fixture.calls, 0, "policy-off login never collects");
+  const automatic = await verifyLogin("https://new.example", {
+    renewed: false, email: "owner@example.test", organizationName: "Automatic fixture", autoCollect: true,
+  });
+  assert.equal(fixture.calls, 1);
+  assert.deepEqual(fixture.scheduled, [true], "schedule only after foreground collection");
+  assert.equal(automatic.config.lastPushedThrough, "2026-09-05", "scheduling preserves the accepted cursor");
+  fixture.scheduled = [];
+  fixture.completed = false;
+  fixture.fail = true;
+  await assert.rejects(verifyLogin("https://new.example", {
+    renewed: false, email: "owner@example.test", organizationName: "Automatic fixture", autoCollect: true,
+  }), /Machine linked, but the first collection failed: fixture collection failure/);
+  assert.equal(loadConfig().linkToken, "new-link-credential", "collection errors retain the successful link");
+  assert.equal(loadConfig().lastPushedThrough, undefined, "failed collection never advances history");
+  assert.deepEqual(fixture.scheduled, [true], "schedule retries after collection failure");
+
+  fixture.fail = false;
+  for (const result of ["busy", "empty"]) {
+    fixture.scheduled = [];
+    fixture.result = result;
+    const lines = [];
+    console.log = (line) => lines.push(line);
+    const pending = await verifyLogin("https://new.example", {
+      renewed: true, email: "owner@example.test", organizationName: "Automatic fixture", autoCollect: true,
+    });
+    assert.equal(pending.config.lastPushedThrough, undefined);
+    assert.ok(lines.some(line => line.includes(result === "busy" ? "This login did not upload" : "no usage upload was confirmed")));
+  }
+  console.log = () => {};
+
   let reads = 0;
   globalThis.fetch = async (input, init) => {
     reads++;
@@ -145,6 +203,7 @@ try {
   globalThis.fetch = async () => Response.json({ scope: { type: "team", teams: [{ id: "wrong", name: "Other" }] } });
   await assert.rejects(usage({ scope: "team", team: "Engineering", json: true }), /requested reporting scope/);
 } finally {
+  delete globalThis.__loginFixture;
   globalThis.fetch = originalFetch;
   console.log = originalLog;
   if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;

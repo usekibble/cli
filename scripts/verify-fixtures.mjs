@@ -7,14 +7,13 @@ import { createSource, TokscaleHybridSource, TOKSCALE_CORE_AGENTS } from "../dis
 // Run fixture modules sequentially: some temporarily replace process globals.
 await import("./verify-repos.mjs");
 await import("./verify-transcripts.mjs");
-await import("./verify-login.mjs");
 await import("./verify-config.mjs");
 await import("./verify-plans.mjs");
 await import("./verify-lock.mjs");
 await import("./verify-schedule.mjs");
 await import("./verify-updates.mjs");
 // Adapter fixtures replace module loading, so each needs a fresh module cache.
-for (const fixture of ["verify-push.mjs", "verify-pricing.mjs"]) {
+for (const fixture of ["verify-login.mjs", "verify-push.mjs", "verify-pricing.mjs"]) {
   const checked = spawnSync(process.execPath, [fileURLToPath(new URL(fixture, import.meta.url))], { encoding: "utf8" });
   assert.equal(checked.status, 0, checked.stderr || checked.stdout || checked.error?.message);
   console.log(checked.stdout.trim());

@@ -92,13 +92,15 @@ function isIdle(c: CapabilityRecord): boolean {
  * the only way a day worked through an outage ever arrives.
  */
 function resumeFrom(config: KibbleConfig): string {
-  const floor = utcDay(-MAX_BACKFILL_DAYS);
+  const floor = utcDay(-(MAX_BACKFILL_DAYS - 1));
   const last = isUtcDay(config.lastPushedThrough) && config.lastPushedThrough <= utcDay()
     ? config.lastPushedThrough
     : undefined;
-  const wanted = last && last < utcDay(-1) ? last : utcDay(-1);
+  const wanted = last ? (last < utcDay(-1) ? last : utcDay(-1)) : floor;
   return wanted < floor ? floor : wanted;
 }
+
+export type PushResult = "pushed" | "empty" | "busy" | "dry-run";
 
 export async function push(opts: {
   since?: string;
@@ -108,7 +110,7 @@ export async function push(opts: {
   capabilities?: boolean;
   /** One line per run, for the hourly schedule's log. */
   quiet?: boolean;
-}): Promise<void> {
+}): Promise<PushResult> {
   const config = loadConfig();
   const say = opts.quiet ? () => {} : console.log;
   const stamp = () => new Date().toISOString();
@@ -138,16 +140,16 @@ export async function push(opts: {
       `${opts.quiet ? `${stamp()}  ` : ""}Another \`kibble push\` has been running for ` +
         `${Math.round(lock.busy / 1000)}s; leaving this hour to it.`,
     );
-    return;
+    return "busy";
   }
 
   try {
-    await run();
+    return await run();
   } finally {
     if (lock && "release" in lock) lock.release();
   }
 
-  async function run(): Promise<void> {
+  async function run(): Promise<PushResult> {
     const pricing = new PricingContext();
     const source = createSource({ pricing });
     const result = await source.collect({ since, until });
@@ -166,7 +168,7 @@ export async function push(opts: {
     });
     if (rows.length === 0 && repos.length === 0 && capabilities.length === 0 && modelActivity.length === 0) {
       console.log(`${opts.quiet ? `${stamp()}  ` : ""}No usage found for ${since}..${until}.`);
-      return;
+      return "empty";
     }
 
     const total = rows.reduce((sum, r) => sum + r.costMicros, 0);
@@ -220,7 +222,7 @@ export async function push(opts: {
           "plan tier.\n" +
           "No prompts, no file contents, no tool arguments, no paths, no ids.",
       );
-      return;
+      return "dry-run";
     }
 
     if (!config.linkToken) {
@@ -274,7 +276,7 @@ export async function push(opts: {
       !sameServerOrigin(next.server, config.server)
     ) {
       say("Link changed while this push was running; kept the new link's sync state.");
-      return;
+      return "pushed";
     }
     // A targeted push after an outstanding gap must not move the automatic
     // cursor past days it did not cover. Invalid or future saved cursors are
@@ -306,6 +308,7 @@ export async function push(opts: {
       );
     }
     enforcePolicy(next, body.autoCollect, (line) => console.log(opts.quiet ? `${stamp()}  ${line}` : line));
+    return "pushed";
   }
 }
 

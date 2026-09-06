@@ -90,6 +90,16 @@ try {
     return Response.json({ applied: 1, autoCollect: true, collectCapabilities: false });
   };
 
+  // A concurrent foreground caller must know no upload was performed.
+  const { acquire } = await import(`${dist}lock.js`);
+  saveConfig(linked());
+  const held = acquire();
+  assert.ok("release" in held);
+  try {
+    assert.equal(await push({ quiet: true }), "busy");
+    assert.equal(requests.length, 0);
+  } finally { held.release(); }
+
   // A one-day manual repair after a gap must not skip the missing days.
   saveConfig(linked());
   await push({ since: "2026-09-05", until: "2026-09-05", quiet: true });
@@ -102,6 +112,17 @@ try {
   await push({ until: "2026-09-05", quiet: true });
   assert.deepEqual(fixture.ranges.at(-1), { since: "2026-09-01", until: "2026-09-05" });
   assert.equal(loadConfig().lastPushedThrough, "2026-09-05");
+
+  // A new machine imports 30 inclusive UTC days, and a stale cursor cannot
+  // widen that window. A subsequent sync still overlaps yesterday and today.
+  for (const cursor of [undefined, "2025-01-01"]) {
+    saveConfig(linked({ lastPushedThrough: cursor }));
+    await push({ quiet: true });
+    assert.deepEqual(fixture.ranges.at(-1), { since: "2026-08-07", until: "2026-09-05" });
+    assert.equal(loadConfig().lastPushedThrough, "2026-09-05");
+    await push({ quiet: true });
+    assert.deepEqual(fixture.ranges.at(-1), { since: "2026-09-04", until: "2026-09-05" });
+  }
 
   // A future saved cursor is not trusted, and an old targeted range does not
   // replace the implicit outstanding interval with an even older cursor.

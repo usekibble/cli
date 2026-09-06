@@ -12,13 +12,18 @@ internal implementation details.
 
 ```
 npm install -g @usekibble/cli
-kibble login        # OAuth device grant, links this machine
-kibble push         # send today's counts now
+kibble login        # links this machine and sends initial usage when org policy is on
+kibble push         # send usage manually, or retry a failed collection
 kibble schedule status
 ```
 
-`kibble login` installs a background push (hourly and at startup) via launchd,
-cron or Task Scheduler when your organization asks for it.
+`kibble login` sends the first usage immediately, then installs a background push
+(hourly and at startup) via launchd, cron or Task Scheduler when your organization
+asks for automatic collection. The first sync imports available usage from today
+and the preceding 29 UTC days. Refresh My usage after the terminal confirms the
+push. If automatic collection is off, login sends nothing: run `kibble push`
+to import that history. Collection failures are reported in the terminal; retry
+with `kibble push` or diagnose them with `kibble doctor`.
 
 CLI prompts, help, status messages and errors are in English regardless of
 the terminal locale.
@@ -103,7 +108,7 @@ adds the remaining agents. The two sources never contribute usage for the same
 agent in one push. Manual pushes, scheduled pushes and `kibble doctor` use this
 same collector, with no parser option to configure.
 
-Automatic pushes resume from the last accepted day, bounded to 30 days.
+Automatic pushes resume from the last accepted day, bounded to 30 UTC days including today.
 A targeted `--since` / `--until` push advances that cursor only when it covers
 the outstanding interval. Replayed transcript records count once, and large
 transcripts are read incrementally in the shared collection pass.

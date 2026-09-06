@@ -53,13 +53,13 @@ program
 
 program
   .command("push")
-  .option("--since <date>", "inclusive UTC start date, YYYY-MM-DD")
+  .option("--since <date>", "inclusive UTC start date, YYYY-MM-DD (first sync defaults to 30 days including today)")
   .option("--until <date>", "inclusive UTC end date, YYYY-MM-DD")
   .option("--dry-run", "print what would be sent, send nothing")
   .option("--server <url>", "Kibble server base URL")
   .option("--quiet", "print one line per run (used by the hourly schedule)")
   .description("send daily usage aggregates")
-  .action(push);
+  .action(async (opts) => { await push(opts); });
 
 program
   .command("usage")

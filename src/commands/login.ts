@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { loadConfig, saveConfig } from "../config.js";
 import { installId } from "../device.js";
 import { sameServerOrigin } from "../server.js";
-import { enforcePolicy, installed, removeSchedule } from "./schedule.js";
+import { enforcePolicy, removeSchedule } from "./schedule.js";
+import { push } from "./push.js";
 import { usageText } from "../usage-messages.js";
 import { offerAutomaticUpdates } from "../update-consent.js";
 
@@ -16,7 +17,8 @@ import { offerAutomaticUpdates } from "../update-consent.js";
  * ever holds an opaque code and polls; the human approves in whatever browser
  * they happen to have.
  *
- * Nothing here reads a log file, and nothing here sees a password. The command
+ * Authorization never reads a password. After linking, organization policy may
+ * start a foreground collection of the existing agent logs. The command
  * ends with one credential on disk: a link token that can push counts for one
  * member and read personal usage. With --reporting, reads may also use the
  * current dashboard role. The session is never persisted.
@@ -142,15 +144,30 @@ export async function login(opts: LoginOptions): Promise<void> {
 
   console.log(usageText(linked.reportingAccess ? "reportingEnabled" : "reportingDisabled"));
 
-  // The organization's call, made once in Settings: with automatic collection
-  // on, the schedule goes in here and nobody has to remember a second command.
+  // Upload before installing the scheduler, whose startup job could otherwise
+  // win the push lock and hide the first collection result in a background log.
   if (linked.autoCollect) {
-    const already = installed();
-    enforcePolicy(next, true, console.log);
-    if (already) console.log("Automatic collection is required by your organization and already scheduled.");
-    console.log("Run `kibble push` to send today's usage now; `kibble schedule status` shows the background job.");
+    console.log("Collecting available usage from the last 30 UTC days now...");
+    try {
+      const result = await push({});
+      if (result === "busy") {
+        console.log("This login did not upload usage because another push is running. Wait for it to finish, then run `kibble push` to confirm collection for this link.");
+      } else if (result === "empty") {
+        console.log("No supported usage was found in the initial window. Run `kibble doctor` to check available logs; no usage upload was confirmed.");
+      }
+    } catch (error) {
+      throw new Error(`Machine linked, but the first collection failed: ${(error as Error).message}. Run \`kibble push\` to retry; \`kibble doctor\` checks collection.`);
+    } finally {
+      // Keep retries scheduled after an error or an empty scan. Use the latest
+      // policy and cursor, since a successful push may have updated both.
+      const latest = loadConfig();
+      if (latest.linkToken === linked.linkToken && sameServerOrigin(latest.server, server)) {
+        enforcePolicy(latest, latest.autoCollect, console.log);
+      }
+    }
+    console.log("Run `kibble schedule status` to check the background job. After a successful push, refresh My usage in the dashboard.");
   } else {
-    console.log("Run `kibble push` to send today's usage, or `kibble schedule install` to push every hour.");
+    console.log("Automatic collection is off. Run `kibble push` to import available usage from the last 30 UTC days now, or `kibble schedule install` to push every hour.");
   }
   await offerAutomaticUpdates(opts.autoUpdate);
 }
