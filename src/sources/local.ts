@@ -2,9 +2,11 @@ import { homedir } from "node:os";
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { CapabilityCollector, type CapabilityRecord, type UsageCounts } from "./capabilities.js";
+import { copilotHome, copilotTranscripts } from "./copilot.js";
 import { RepoCollector, type RepoUsage } from "./repos.js";
 import { ModelActivityCollector, type ModelActivity } from "./model-activity.js";
 import { codexHome } from "./codex-inventory.js";
+import { scanVsCode } from "./vscode.js";
 import {
   harvestCwds,
   listJsonl,
@@ -23,11 +25,14 @@ import {
  *
  * Codex sessions ride the same rule: one walk feeds every requested Codex
  * visitor together.
+ * Copilot's events.jsonl files do the same through their own visitors.
  */
 export interface ScanOptions {
   since: string;
   until: string;
   home?: string;
+  copilotHome?: string;
+  vscodeUserDataDirs?: string[];
   priceOf?: (model: string, usage: UsageCounts, provider?: string) => number;
 }
 
@@ -41,6 +46,7 @@ export function scanLocal(
   options: ScanOptions & { repos?: boolean; capabilities?: boolean },
 ): LocalScan {
   const home = options.home ?? homedir();
+  const copilotRoot = options.copilotHome ?? copilotHome(home);
   const wantRepos = options.repos ?? true;
   const wantCapabilities = options.capabilities ?? true;
   const floor = transcriptFloor(options.since);
@@ -48,7 +54,7 @@ export function scanLocal(
   const repoCollector = wantRepos ? new RepoCollector(options) : null;
   const modelCollector = wantRepos ? new ModelActivityCollector(options) : null;
   const capabilityCollector = wantCapabilities
-    ? new CapabilityCollector({ ...options, home })
+    ? new CapabilityCollector({ ...options, home, copilotHome: copilotRoot })
     : null;
 
   const claude = partitionByFloor(listJsonl(join(home, ".claude", "projects")), floor);
@@ -86,6 +92,33 @@ export function scanLocal(
       if (history && history.mtimeMs >= floor) {
         readTranscripts([{ path, mtimeMs: history.mtimeMs }], [capabilityCollector.codexHistoryVisitor()]);
       }
+    }
+  }
+
+  if (repoCollector || capabilityCollector) {
+    // Replay VS Code's metadata log once for both sidecars, never read its
+    // separate content transcript or reconstruct tool input from messages.
+    for (const request of scanVsCode({ ...options, home, userDataDirs: options.vscodeUserDataDirs }).requests) {
+      repoCollector?.vscode(request);
+      capabilityCollector?.vscode(request);
+    }
+    const copilot = partitionByFloor(copilotTranscripts(copilotRoot), floor);
+    readTranscripts(copilot.recent, [
+      ...(repoCollector ? [repoCollector.copilot()] : []),
+      ...(capabilityCollector ? [capabilityCollector.copilotVisitor()] : []),
+    ]);
+    if (capabilityCollector) {
+      const cwds = new Set<string>();
+      harvestCwds(copilot.older, cwds, (record) => {
+        if (record.type !== "session.start" && record.type !== "session.resume") return null;
+        const data = record.data;
+        if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+        const context = (data as Record<string, unknown>).context;
+        return context && typeof context === "object" && !Array.isArray(context)
+          ? (context as Record<string, unknown>).cwd
+          : null;
+      });
+      for (const cwd of cwds) capabilityCollector.addCopilotCwd(cwd);
     }
   }
 

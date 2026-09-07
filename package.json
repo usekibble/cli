@@ -1,7 +1,7 @@
 {
   "name": "@usekibble/cli",
-  "version": "0.5.1",
-  "description": "The Kibble collector: reports what Claude Code and Codex spend, per engineer, team, model and repo. Counts only, never prompts, code or paths.",
+  "version": "0.6.0",
+  "description": "The Kibble collector: reports Claude Code, Codex and Copilot usage, per engineer, team, model and repo. Counts only, never prompts, code or paths.",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-launcher.mjs",
     "prepublishOnly": "pnpm build",
@@ -14,6 +14,8 @@
   "keywords": [
     "claude-code",
     "codex",
+    "github-copilot",
+    "copilot",
     "cursor",
     "tokens",
     "cost",
@@ -39,8 +41,10 @@
     "@tokscale/cli": "4.14.0",
     "@tokscale/core": "1.4.3",
     "commander": "14.0.3",
+    "jsonc-parser": "^3.3.1",
     "semver": "7.8.5",
-    "smol-toml": "1.8.0"
+    "smol-toml": "1.8.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^20",

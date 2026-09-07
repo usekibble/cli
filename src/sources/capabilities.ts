@@ -1,11 +1,14 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
+import { parse as parseYaml } from "yaml";
+import { copilotCapabilityName, readCopilotConfig } from "./copilot-config.js";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
 import { TranscriptDeduper } from "./transcript-dedup.js";
 import { codexItem, codexSettings } from "./codex.js";
 import { codexRoots } from "./codex-inventory.js";
 import { codexCommandName, codexSkillSelections } from "./codex-capabilities.js";
+import type { VsCodeRequest } from "./vscode.js";
 
 /**
  * Capability telemetry: which skills, slash commands, and MCP servers a machine
@@ -42,6 +45,9 @@ import { codexCommandName, codexSkillSelections } from "./codex-capabilities.js"
  *     recognized against built-ins, installed commands or /prompts:name.
  *     Arguments and expanded prompts are never inspected. Codex capability
  *     attribution and implicit shell-based skill reads remain unobserved.
+ *   - Copilot skills from its documented personal, project and installed
+ *     plugin roots, plus skill names, triggers, body lengths and MCP server
+ *     names from structured Copilot session events.
  *
  * Bodies and descriptions are measured and discarded; only their sizes are kept.
  *
@@ -56,7 +62,7 @@ import { codexCommandName, codexSkillSelections } from "./codex-capabilities.js"
 export type CapabilityKind = "skill" | "command" | "mcp";
 
 /** Which agent the row is a fact about. Every capability row carries one. */
-export type CapabilityAgent = "claude-code" | "codex";
+export type CapabilityAgent = "claude-code" | "codex" | "copilot";
 
 export interface UsageCounts {
   input_tokens?: number;
@@ -400,6 +406,152 @@ export function codexInventory(home = homedir(), cwds: Iterable<string> = []): I
   return registry.inventory;
 }
 
+/** Directories immediately below a path, with failures treated as an empty root. */
+function directories(dir: string): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .map((name) => join(dir, name))
+    .filter((path) => {
+      try {
+        return statSync(path).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+}
+
+/**
+ * Every Copilot skill and compatible Claude command this machine can load.
+ *
+ * Copilot's documented order is project .github, .agents, then .claude;
+ * inherited copies; ~/.copilot then ~/.agents; and installed plugins. We only
+ * need an installed/not-installed answer, but preserve that order so a repeated
+ * name gets the same description Copilot advertises. Built-ins and remote
+ * organization skills have no stable directory outside the installed CLI and
+ * remain invocation-only, just like Claude Code's built-ins.
+ */
+export function copilotInventory(
+  home = homedir(),
+  cwds: Iterable<string> = [],
+  root = join(home, ".copilot"),
+  env: NodeJS.ProcessEnv = process.env,
+): Inventory {
+  const skills = new Map<string, InstalledCapability>();
+  const commands = new Map<string, InstalledCapability>();
+  const claimedSkills = new Set<string>();
+  const claimedCommands = new Set<string>();
+
+  const add = (
+    map: Map<string, InstalledCapability>,
+    claimed: Set<string>,
+    entry: { name: string; path: string },
+    source: CapabilitySource,
+    withDescription: boolean,
+  ) => {
+    let name: string | null = copilotCapabilityName(entry.name);
+    if (withDescription) {
+      try {
+        const text = readFileSync(join(entry.path, "SKILL.md"), "utf8");
+        const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
+        if (!frontmatter) return;
+        const metadata = parseYaml(frontmatter);
+        name = copilotCapabilityName(metadata?.name);
+      } catch {
+        return;
+      }
+    }
+    if (!name || map.has(name)) return;
+    let realPath: string;
+    try {
+      realPath = realpathSync(entry.path);
+    } catch {
+      return;
+    }
+    const alias = claimed.has(realPath);
+    claimed.add(realPath);
+    map.set(name, {
+      name,
+      source,
+      realPath,
+      descriptionTokens: withDescription ? descriptionTokensFor(realPath) : 0,
+      ...(alias ? { alias: true } : {}),
+    });
+  };
+
+  const projectDirs = new Set<string>();
+  for (const cwd of cwds) {
+    let dir = cwd;
+    for (let depth = 0; depth < 32; depth++) {
+      if (!dir || dir === home) break;
+      projectDirs.add(dir);
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  const orderedProjects = [...projectDirs].sort(
+    (a, b) => b.split(sep).length - a.split(sep).length || a.localeCompare(b),
+  );
+  for (const dir of orderedProjects) {
+    for (const namespace of [".github", ".agents", ".claude"]) {
+      for (const entry of listEntries(join(dir, namespace, "skills"), "skill")) {
+        add(skills, claimedSkills, entry, "project", true);
+      }
+    }
+    for (const entry of listEntries(join(dir, ".claude", "commands"), "command")) {
+      add(commands, claimedCommands, entry, "project", false);
+    }
+  }
+
+  for (const dir of [join(root, "skills"), join(home, ".agents", "skills")]) {
+    for (const entry of listEntries(dir, "skill")) {
+      add(skills, claimedSkills, entry, "personal", true);
+    }
+  }
+  for (const entry of listEntries(join(home, ".claude", "commands"), "command")) {
+    add(commands, claimedCommands, entry, "personal", false);
+  }
+
+  const config = { ...readCopilotConfig(join(root, "config.json")), ...readCopilotConfig(join(root, "settings.json")) };
+  const custom = [
+    ...(env.COPILOT_SKILLS_DIRS ?? "").split(","),
+    ...(Array.isArray(config.skillDirectories) ? config.skillDirectories : []),
+  ];
+  for (const dir of custom) {
+    if (typeof dir !== "string" || !dir.trim()) continue;
+    const path = dir.trim().replace(/^~(?=[/\\])/, home);
+    for (const entry of listEntries(path, "skill")) add(skills, claimedSkills, entry, "personal", true);
+  }
+
+  const installed = join(root, "installed-plugins");
+  const pluginDirs = directories(installed).flatMap((marketplace) => [
+    marketplace,
+    ...directories(marketplace),
+  ]);
+  for (const plugin of pluginDirs) {
+    const manifest = [".plugin/plugin.json", "plugin.json", ".github/plugin/plugin.json", ".claude-plugin/plugin.json"]
+      .map((path) => readCopilotConfig(join(plugin, path))).find(Boolean);
+    if (!manifest) continue;
+    for (const [kind, defaults] of [["skill", "skills"], ["command", "commands"]] as const) {
+      const raw = manifest[defaults] ?? defaults;
+      const paths = Array.isArray(raw) ? raw : [raw];
+      for (const path of paths) {
+        if (typeof path !== "string") continue;
+        for (const entry of listEntries(join(plugin, path), kind)) {
+          add(kind === "skill" ? skills : commands, kind === "skill" ? claimedSkills : claimedCommands, entry, "plugin", kind === "skill");
+        }
+      }
+    }
+  }
+
+  return { skills, commands };
+}
+
 interface Bucket {
   invocations: number;
   triggerTyped: number;
@@ -437,6 +589,18 @@ function bucket(): Bucket {
 export class CapabilityCollector {
   private readonly claudeSeen = new TranscriptDeduper();
   private readonly codexSeen = new TranscriptDeduper();
+  /** No tool arguments or skill bodies: only explicitly serialized names. */
+  vscode(r: VsCodeRequest): void {
+    if (r.cwd) this.copilotCwds.add(r.cwd);
+    this.active("copilot", r.date);
+    if (r.command) {
+      const bucket = this.at("copilot", r.date, "command", r.command);
+      bucket.invocations++; bucket.triggerTyped++;
+    }
+    for (const tool of r.tools) {
+      if (tool.server) this.at("copilot", r.date, "mcp", tool.server).invocations++;
+    }
+  }
   /** key: `${agent}|${date}|${kind}|${name}` */
   private readonly seen = new Map<string, Bucket>();
   /** Days each agent was active in the window; anchors that agent's idle rows. */
@@ -449,17 +613,22 @@ export class CapabilityCollector {
    */
   private readonly cwds = new Set<string>();
   private readonly codexCwds = new Set<string>();
+  /** Copilot contexts feed its .github, .agents and .claude project roots. */
+  private readonly copilotCwds = new Set<string>();
   private readonly home: string;
+  private readonly copilotHome: string;
   private readonly priceOf: (model: string, u: UsageCounts) => number;
 
   constructor(private readonly options: {
     since: string;
     until: string;
     home?: string;
+    copilotHome?: string;
     /** Cost in micros for one record's usage, so rates match Lane A exactly. */
     priceOf?: (model: string, u: UsageCounts) => number;
   }) {
     this.home = options.home ?? homedir();
+    this.copilotHome = options.copilotHome ?? join(this.home, ".copilot");
     this.priceOf = options.priceOf ?? (() => 0);
   }
 
@@ -507,6 +676,11 @@ export class CapabilityCollector {
 
   private codexInstalled(): Inventory {
     return this.codexInventoryCache ??= codexInventory(this.home, this.codexCwds);
+  }
+
+  /** A Copilot context harvested from a session skipped by the mtime floor. */
+  addCopilotCwd(cwd: string): void {
+    if (cwd) this.copilotCwds.add(cwd);
   }
 
   visitor(): TranscriptVisitor {
@@ -710,11 +884,87 @@ export class CapabilityCollector {
     } };
   }
 
+  /**
+   * Capability facts from GitHub Copilot CLI's durable session events.
+   *
+   * skill.invoked carries the exact skill name, trigger and injected body. We
+   * keep the name and body length only. tool.execution_start carries the MCP
+   * server name separately from its arguments, so only that name is counted.
+   * Copilot does not durably attribute later model tokens to a skill, so the
+   * attribution columns remain zero rather than being inferred.
+   */
+  copilotVisitor(): TranscriptVisitor {
+    const { active, options, copilotCwds } = this;
+    const at = (date: string, kind: CapabilityKind, name: string) =>
+      this.at("copilot", date, kind, name);
+    const rememberContext = (raw: unknown) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+      const cwd = (raw as Record<string, unknown>).cwd;
+      if (typeof cwd === "string" && cwd) copilotCwds.add(cwd);
+    };
+    const seenEvents = new Set<string>();
+    return {
+      record: (record: Rec) => {
+        if (typeof record.id === "string") {
+          if (seenEvents.has(record.id)) return;
+          seenEvents.add(record.id);
+        }
+        const data =
+          record.data && typeof record.data === "object" && !Array.isArray(record.data)
+            ? (record.data as Record<string, unknown>)
+            : {};
+        if (record.type === "session.start" || record.type === "session.resume") rememberContext(data.context);
+        else if (record.type === "session.context_changed") rememberContext(data);
+
+        const date = String(record.timestamp ?? "").slice(0, 10);
+        if (!date || date < options.since || date > options.until) return;
+        if (
+          record.type === "user.message" ||
+          record.type === "assistant.turn_start" ||
+          record.type === "session.shutdown" ||
+          record.type === "skill.invoked" ||
+          record.type === "tool.execution_start"
+        ) {
+          active("copilot", date);
+        }
+
+        if (record.type === "skill.invoked") {
+          const name = copilotCapabilityName(data.name);
+          if (!name) return;
+          const bucket = at(date, "skill", name);
+          bucket.invocations += 1;
+          if (data.trigger === "user-invoked") bucket.triggerTyped += 1;
+          else if (data.trigger === "agent-invoked") bucket.triggerModel += 1;
+          if (typeof data.content === "string") bucket.contextTokens += approxTokens(data.content.length);
+          return;
+        }
+
+        if (record.type === "tool.execution_start") {
+          const server = copilotCapabilityName(data.mcpServerName);
+          if (server) at(date, "mcp", server).invocations += 1;
+          return;
+        }
+
+        // Accept a command name when present without touching its arguments.
+        // Current CLI versions keep this event ephemeral, so ordinary logs
+        // cannot establish command invocation counts.
+        if (record.type === "command.execute") {
+          const name = copilotCapabilityName(data.commandName);
+          if (!name) return;
+          const bucket = at(date, "command", name);
+          bucket.invocations += 1;
+          bucket.triggerTyped += 1;
+        }
+      },
+    };
+  }
+
   finish(): CapabilityRecord[] {
-    const { home, cwds, seen, activeDates } = this;
+    const { home, cwds, copilotCwds, copilotHome, seen, activeDates } = this;
     const inventories: Record<CapabilityAgent, Inventory> = {
       "claude-code": inventory(home, cwds),
       codex: this.codexInstalled(),
+      copilot: copilotInventory(home, copilotCwds, copilotHome),
     };
 
     const out: CapabilityRecord[] = [];
@@ -749,7 +999,7 @@ export class CapabilityCollector {
     // recent active day so it lands in the window the dashboard is showing, and
     // not at all for an agent that never ran in the window. This is the row that
     // only a local collector can produce.
-    for (const agent of ["claude-code", "codex"] as const) {
+    for (const agent of ["claude-code", "codex", "copilot"] as const) {
       const anchor = [...(activeDates.get(agent) ?? [])].sort().pop();
       if (!anchor) continue;
       const inv = inventories[agent];

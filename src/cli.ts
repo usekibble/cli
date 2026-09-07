@@ -79,7 +79,7 @@ const skill = program
   .description(usageText("skillHelp"));
 skill
   .command("install")
-  .description("write SKILL.md into ~/.claude/skills (and ~/.codex/skills when Codex is installed)")
+  .description("write SKILL.md into installed agents' personal skill directories")
   .action(skillInstall);
 skill
   .command("uninstall")

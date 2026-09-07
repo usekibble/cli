@@ -94,10 +94,14 @@ function visitLine(line: string, visitors: TranscriptVisitor[]): void {
   } catch {
     return;
   }
+  if (!rec || typeof rec !== "object" || Array.isArray(rec)) return;
   for (const visitor of visitors) visitor.record(rec);
 }
 
-/** Read each file once, parse each line once, hand the record to every visitor. */
+/**
+ * Read each file once, parse each line once, hand the record to every visitor.
+ * Reads are always strict: an incomplete day must never replace complete usage.
+ */
 export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVisitor[]): void {
   if (visitors.length === 0) return;
   const chunk = Buffer.allocUnsafe(READ_BYTES);
@@ -191,7 +195,11 @@ function head(path: string, bytes: number): string {
  * Claude Code stamps `cwd` on every record, so the head of the file answers it.
  * The last line of the head is dropped: at 16 KB it is usually cut in half.
  */
-export function harvestCwds(files: TranscriptFile[], into: Set<string>, agent: "claude-code" | "codex" = "claude-code"): void {
+export function harvestCwds(
+  files: TranscriptFile[],
+  into: Set<string>,
+  agentOrCwd: "claude-code" | "codex" | ((record: Rec) => unknown) = "claude-code",
+): void {
   for (const file of files) {
     const text = head(file.path, HEAD_BYTES);
     if (!text) continue;
@@ -205,8 +213,9 @@ export function harvestCwds(files: TranscriptFile[], into: Set<string>, agent: "
       } catch {
         continue;
       }
+      if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
       const payload = rec.payload && typeof rec.payload === "object" ? rec.payload as Rec : {};
-      const cwd = agent === "codex" ? payload.cwd : rec.cwd;
+      const cwd = typeof agentOrCwd === "function" ? agentOrCwd(rec) : agentOrCwd === "codex" ? payload.cwd : rec.cwd;
       if (typeof cwd === "string" && cwd) into.add(cwd);
     }
   }

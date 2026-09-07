@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { codexHome } from "./codex-inventory.js";
+import { readCopilotConfig } from "./copilot-config.js";
 
 /**
  * How each agent on this machine is billed: a flat subscription, metered API
@@ -9,9 +10,10 @@ import { codexHome } from "./codex-inventory.js";
  * subscription machine's local rows are covered by a seat, not by the
  * list-price estimate the collector puts beside them.
  *
- * Both files this reads hold far more than what leaves: `~/.claude.json`
+ * The files this reads hold far more than what leaves: `~/.claude.json`
  * carries the account, organization and machine ids and the signed-in email,
- * `~/.codex/auth.json` carries live OAuth tokens. Each is parsed, three fields
+ * `~/.codex/auth.json` carries live OAuth tokens, and Copilot's config can hold
+ * GitHub auth state when no keychain is available. Each is parsed, three fields
  * are copied out, and the rest is dropped here. Nothing on the wire is an
  * identifier: `mode` and `tier` are closed enums the server rejects any other
  * value for, and `multiplier` is the 5 or 20 of a Max plan.
@@ -31,6 +33,9 @@ import { codexHome } from "./codex-inventory.js";
  *                `chatgpt_plan_type` claim in the id_token JWT (`free`, `go`,
  *                `plus`, `pro`, `team`, `business`, `enterprise`, `edu`,
  *                and dated or usage-based variants of those).
+ *   Copilot      COPILOT_PROVIDER_BASE_URL selects BYOK; otherwise a
+ *                saved GitHub login establishes subscription mode only.
+ *                No verified tier is persisted locally, so none is guessed.
  */
 export const PLAN_MODES = ["subscription", "api", "cloud"] as const;
 export type PlanMode = (typeof PLAN_MODES)[number];
@@ -49,7 +54,7 @@ export type PlanTier = (typeof PLAN_TIERS)[number];
 
 export interface AgentPlan {
   /** Normalized agent name, the same one the usage rows carry. */
-  agent: "claude-code" | "codex";
+  agent: "claude-code" | "codex" | "copilot";
   mode: PlanMode;
   /** Only when the mode is a subscription and the file names one. */
   tier?: PlanTier;
@@ -223,12 +228,39 @@ export function codexPlan(home: string, env: NodeJS.ProcessEnv): AgentPlan | nul
   return null;
 }
 
+/**
+ * GitHub Copilot CLI billing mode. Tokens and usernames in config.json are
+ * never copied; only the presence of a login is used. The tier is unknown.
+ * A custom provider is routed through its API or cloud account instead.
+ */
+export function copilotPlan(home: string, env: NodeJS.ProcessEnv): AgentPlan | null {
+  const agent = "copilot" as const;
+  if (typeof env.COPILOT_PROVIDER_BASE_URL === "string" && env.COPILOT_PROVIDER_BASE_URL) {
+    return {
+      agent,
+      mode: env.COPILOT_PROVIDER_TYPE?.toLowerCase() === "azure" ? "cloud" : "api",
+    };
+  }
+
+  const root = env.COPILOT_HOME || join(home, ".copilot");
+  const config = readCopilotConfig(join(root, "config.json"));
+  const rawUsers = config?.loggedInUsers;
+  const loggedIn =
+    (Array.isArray(rawUsers) && rawUsers.length > 0) ||
+    (!!rawUsers && typeof rawUsers === "object" && Object.keys(rawUsers).length > 0);
+  const tokenLogin = !!env.COPILOT_GITHUB_TOKEN;
+  if (loggedIn || tokenLogin) {
+    return { agent, mode: "subscription" };
+  }
+  return null;
+}
+
 /** Every agent whose billing this machine can tell. */
 export function readPlans(options: PlanOptions = {}): AgentPlan[] {
   const home = options.home ?? homedir();
   const env = options.env ?? process.env;
   const plans: AgentPlan[] = [];
-  for (const read of [claudePlan, codexPlan]) {
+  for (const read of [claudePlan, codexPlan, copilotPlan]) {
     try {
       const plan = read(home, env);
       if (plan) plans.push(plan);

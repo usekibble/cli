@@ -1,8 +1,8 @@
 # @usekibble/cli
 
-Kibble (usekibble.com) is a Claude Code and Codex usage dashboard for teams.
+Kibble (usekibble.com) is a Claude Code, Codex and GitHub Copilot usage dashboard for teams.
 This is its open-source collector. It reads the usage logs that coding agents (Claude Code,
-Codex) already write on this machine and pushes a per-day summary to your
+Codex, GitHub Copilot CLI and Copilot Chat in VS Code) already write on this machine and pushes a per-day summary to your
 Kibble dashboard, so a team lead can see what every coding agent spent this
 week, per engineer, team, model and repo.
 
@@ -103,10 +103,16 @@ ordinary runs load the active release's updater before collection.
 
 Every push automatically collects all supported local agents. The local adapter
 uses the native parser for eight agents and a shared Codex token decoder for
-Codex usage and session ids; the broader CLI parser
-adds the remaining agents. The two sources never contribute usage for the same
-agent in one push. Manual pushes, scheduled pushes and `kibble doctor` use this
-same collector, with no parser option to configure.
+Codex usage and session ids, plus dedicated Copilot CLI and VS Code metadata
+adapters. The broader CLI parser adds only the remaining agents. Copilot's CLI
+and editor totals are combined before ingest; overlapping upstream Copilot
+totals are excluded. Manual pushes, scheduled pushes and `kibble doctor` use
+this same collector, with no parser option to configure.
+
+Dedicated local counters are authoritative for Copilot. Upstream aggregate-only
+Copilot OpenTelemetry totals are excluded because they cannot be reliably
+deduplicated against those sessions. Work recorded only by that telemetry
+source is outside this release's Copilot coverage.
 
 Automatic pushes resume from the last accepted day, bounded to 30 UTC days including today.
 A targeted `--since` / `--until` push advances that cursor only when it covers
@@ -232,7 +238,7 @@ aggregates, not a member or device roster. Deploy the server migration and route
 before releasing this CLI; an older server cannot fulfill scoped reports.
 
 `kibble skill install` writes a `kibble-usage` skill into `~/.claude/skills`
-(and `~/.codex/skills` when Codex is installed). Ask your coding agent about
+(plus Codex and Copilot when installed). Ask your coding agent about
 "my AI usage this month" or "Engineering's usage this week". It discovers
 allowed scopes and runs `kibble usage --json`; credentials stay in the CLI
 config. The skill does not authorize reporting access itself. Run
@@ -247,18 +253,82 @@ automatic skill use and commands omitted from history are outside coverage. Per 
 (Max 5x, ChatGPT Pro), an API key, or a cloud provider's account. Never
 prompts, file contents, tool arguments.
 
-The billing mode is read from the login file each agent already keeps
-(`~/.claude.json`, `~/.codex/auth.json`). Those files also hold account,
-organization and machine ids, your email and live tokens; `src/sources/plans.ts`
-copies out the mode and the tier and nothing else leaves.
+The billing mode is read from the login state each agent already keeps
+(`~/.claude.json`, `~/.codex/auth.json`, and Copilot's config). Those files can
+also hold account, organization and machine ids, your email and live tokens;
+`src/sources/plans.ts` copies out the mode and tier and nothing else leaves.
 
-Finding those skills means looking in three places: your `~/.claude`, the
+Finding Claude Code skills means looking in three places: your `~/.claude`, the
 `.claude` of each checkout you have worked in, and each installed plugin. The
 checkouts come from the working directory your agent records in its own logs,
 walked upwards until a `.claude` turns up. That directory is a path, so it is
 read and discarded here and never sent, the same way repository names are
 reduced before they leave. Which of the three a skill came from, and what
 version it is, are worked out on this machine and are not sent either.
+
+Copilot CLI uses its documented `~/.copilot/session-state/<id>/events.jsonl`
+records. Kibble reads durable session and shutdown counters, repository
+context, tool and hook event types, skill invocation names, and MCP server
+names. It never reads the prompt, reply, tool arguments, tool output, or the
+changed-file paths stored beside those counters. Copilot skills are inventoried
+from its personal, project, shared-agent and installed-plugin roots.
+
+The default collector needs no Copilot telemetry setup. It respects
+`COPILOT_HOME` (use the same value for Kibble and Copilot). Shutdown metrics are
+cumulative: a resumed session contributes only the increase, recorded on the
+UTC day of its shutdown checkpoint. An open or crashed session without a
+shutdown checkpoint has no complete token total to report. These are model
+list-price estimates, not GitHub invoices or AI-credit charges. Cached input
+and reasoning tokens are not charged twice.
+
+Activity and capability counts appear where durable events provide them.
+Tokens spanning multiple repository contexts between checkpoints stay
+unattributed. Copilot CLI does not persist downstream skill-token attribution or
+ordinary slash-command invocations, so those counts are unavailable. A saved
+GitHub login establishes subscription mode, not a tier or seat price; explicit
+BYOK settings establish API/cloud mode. VS Code completions and GitHub's
+cloud coding agent are not covered by this local CLI parser.
+
+### Copilot Chat in VS Code
+
+The default collector also reads VS Code and VS Code Insiders chat storage,
+including legacy JSON snapshots and the current JSONL mutation log. No
+extension, telemetry setting, or Kibble login is needed for a dry run:
+
+```
+kibble doctor
+kibble push --dry-run
+```
+
+It finds the standard user-data locations on macOS, Windows and Linux, plus
+portable installations through `VSCODE_PORTABLE`. If you launch VS Code with
+`--user-data-dir`, set `KIBBLE_VSCODE_USER_DATA_DIR` to that same directory for
+Kibble. Workspace, empty-window and transferred-session stores are supported;
+migrated copies and repeated snapshots are deduplicated before aggregation.
+
+Saved model names (including the model behind Auto), token counters, request
+dates, durations, tool names, explicit MCP server labels and slash-command
+names feed the existing `copilot` rows. A single-folder workspace or recorded
+working-directory URI supplies repo attribution; ambiguous multi-root windows
+stay unattributed. Prompts, responses, tool input/output and document contents
+are discarded before replaying the metadata log. CLI and editor totals sharing
+a day/model are added into one ingest row, not allowed to overwrite each other.
+
+Coverage follows what VS Code saves. Whole-turn `modelTotals` are used when
+available. Otherwise the saved counters describe only the last successful
+model call in a request; multi-round or unknown-round cases produce a warning
+and must not be read as complete agent-loop totals. Cache splits absent from
+those older records are unknown, so estimated cost treats recorded input at
+the input rate. Prices are model-list estimates, not Copilot AI credits or
+invoices. Unrecorded inline completions, remote-only sessions, skill-token
+attribution, and subscription-tier detection are not supplied by this adapter.
+
+For development, `pnpm verify` also exercises Copilot schema fixtures for
+resume, VS Code mutation replay, deduplication, privacy and repository
+attribution before the existing Claude Code raw-transcript comparison. The
+same fixtures run in public CI through `npm run verify:fixtures` after building.
+They establish supported parser behavior, not live accuracy for every Copilot
+installation or a complete count of unrecorded work.
 
 The server's ingest schema is strict, so a field it does not expect is a
 rejected request. Every line this package sends is in `src/`, and it is short

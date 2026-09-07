@@ -4,10 +4,9 @@
  * Kibble never talks to a log parser directly. Parsers are third-party,
  * fast-moving, and single-maintainer (plan section 10) -- so everything
  * downstream depends on this interface instead, and swapping one for another is
- * a new file rather than a rewrite. Three implementations ship today:
- * `TokscaleCoreSource` (the Rust library, in-process), `TokscaleCliSource`
- * (the CLI binary, broader client coverage), and `TokscaleHybridSource`, which
- * combines core rows with CLI-only agents.
+ * a new file rather than a rewrite. The default combines native parsers and
+ * the shared Codex decoder with CLI-only agents through TokscaleHybridSource,
+ * plus dedicated Copilot CLI and VS Code adapters.
  */
 
 import type { PricingContext } from "./pricing.js";

@@ -3,8 +3,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createSource, TokscaleHybridSource, TOKSCALE_CORE_AGENTS } from "../dist/sources/index.js";
+import { DefaultSource, TokscaleHybridSource, TOKSCALE_CORE_AGENTS } from "../dist/sources/index.js";
+import { verifyCopilot } from "./verify-copilot.mjs";
+import { verifyVsCode } from "./verify-vscode.mjs";
 // Run fixture modules sequentially: some temporarily replace process globals.
+await verifyCopilot();
+await verifyVsCode();
 await import("./verify-repos.mjs");
 await import("./verify-transcripts.mjs");
 await import("./verify-config.mjs");
@@ -41,11 +45,6 @@ const fakeSource = (name, daily, sessions) => ({
 });
 
 async function verifyHybridBoundary() {
-  assert.ok(
-    createSource() instanceof TokscaleHybridSource,
-    "default collection must include additional agents without overlapping totals",
-  );
-
   const supported = [...TOKSCALE_CORE_AGENTS];
   const core = fakeSource(
     "core-fixture",
@@ -109,3 +108,31 @@ async function verifyHybridBoundary() {
 }
 
 await verifyHybridBoundary();
+
+async function verifyDefaultBoundary() {
+  const range = { since: "2026-08-21", until: "2026-08-21" };
+  const session = (sessionId, agent, costMicros) => ({
+    sessionId, agent, date: range.since, messageCount: 1, costMicros,
+  });
+  const base = fakeSource("hybrid", [sampleRow("claude-code", 100), sampleRow("cursor", 500), sampleRow("copilot", 900)], [
+    session("claude-session", "claude-code", 100),
+    session("cursor-session", "cursor", 500),
+    session("upstream-copilot", "copilot", 900),
+  ]);
+  const cli = fakeSource("copilot-cli", [sampleRow("copilot", 20)], [session("cli-session", "copilot", 20)]);
+  const vscode = fakeSource("vscode", [sampleRow("copilot", 30)], [session("vscode-session", "copilot", 30)]);
+  const source = new DefaultSource(base, {}, cli, vscode);
+  const result = await source.collect(range);
+  assert.deepEqual(result.daily.map((row) => [row.agent, row.costMicros]), [
+    ["cursor", 500], ["claude-code", 100], ["copilot", 50],
+  ], "default collection must preserve other agents and merge dedicated Copilot counters without upstream overlap");
+  assert.equal(result.daily.find((row) => row.agent === "copilot")?.tokensIn, 50);
+  assert.equal(result.daily.find((row) => row.agent === "copilot")?.messageCount, 2);
+  assert.deepEqual(result.sessions.map((row) => row.sessionId), [
+    "claude-session", "cursor-session", "cli-session", "vscode-session",
+  ], "overlapping upstream Copilot sessions must not enter the dedup ledger");
+  assert.deepEqual(await source.collect(range), result, "repeated default collection must preserve totals");
+  console.log("OK  default collection merges Copilot CLI and VS Code without losing other agents or double counting upstream totals");
+}
+
+await verifyDefaultBoundary();

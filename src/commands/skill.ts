@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { copilotHome } from "../sources/copilot.js";
 
 /**
  * The `kibble-usage` skill: instructions that teach a coding agent to read
@@ -156,7 +157,7 @@ Usage alone does not establish productivity, quality or the cause of a change.
 
 const DIR_NAME = "kibble-usage";
 
-/** Skill roots per agent: Claude Code always, Codex when it is installed. */
+/** Skill roots per agent: Claude Code always, Codex and Copilot when installed. */
 function roots(): { agent: string; dir: string; wanted: boolean }[] {
   const home = homedir();
   return [
@@ -165,6 +166,11 @@ function roots(): { agent: string; dir: string; wanted: boolean }[] {
       agent: "codex",
       dir: join(home, ".codex", "skills", DIR_NAME),
       wanted: existsSync(join(home, ".codex")),
+    },
+    {
+      agent: "copilot",
+      dir: join(copilotHome(home), "skills", DIR_NAME),
+      wanted: existsSync(copilotHome(home)),
     },
   ];
 }

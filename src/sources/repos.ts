@@ -2,15 +2,18 @@ import { looksLikePath, repoName } from "./repo.js";
 import type { UsageCounts } from "./capabilities.js";
 import { TranscriptDeduper } from "./transcript-dedup.js";
 import { codexDuration, codexItem, codexSettings, codexTool, CodexTokenReader } from "./codex.js";
+import { copilotUsageVisitor, type CopilotUsageDelta } from "./copilot.js";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
+import type { VsCodeRequest } from "./vscode.js";
 
 /**
  * The sidecar: what each repo cost, and what the agent did there.
  *
  * Neither tokscale surface reports a workspace, so this reads the transcripts
  * directly. Claude Code records `cwd` on every record; Codex records `cwd`
- * plus a git remote in its session header. Having opened the file for that
- * one field, everything else here is read from the same records: record
+ * plus a git remote in its session header; Copilot records both in its session
+ * context. Having opened the file for that one field, everything else here is
+ * read from the same records: record
  * types, block types, enum values, booleans and integers. The message bodies
  * are never opened.
  *
@@ -41,11 +44,11 @@ import type { Rec, TranscriptVisitor } from "./transcripts.js";
  * facet not on this list.
  */
 export const REPO_FACETS = [
-  /** `tool_use.name` in Claude Code; the semantic item kind in Codex, MCP as `mcp__<server>`. */
+  /** Tool name in Claude Code and Copilot; the semantic item kind in Codex, MCP as `mcp__<server>`. */
   "tool",
   /** Which model answered, per repo. */
   "model",
-  /** `cli`, `claude-desktop`, `claude-vscode`, `sdk-cli`. Codex: `originator`. */
+  /** `cli`, `claude-desktop`, `claude-vscode`, `sdk-cli`. Codex: `originator`; Copilot: `producer`. */
   "entrypoint",
   /** The client version that wrote the record. */
   "version",
@@ -82,16 +85,16 @@ export interface RepoFacetCount {
 export interface RepoActivity {
   /** Distinct session ids seen in the repo that day. */
   sessions: number;
-  /** `tool_use` blocks (Claude Code); classified or legacy completed tool items (Codex). */
+  /** Tool calls reported by each agent's structured event format. */
   toolCalls: number;
-  /** `tool_result.is_error` (Claude Code); a failed or declined completed tool item (Codex). Conflates a rejection with a failure. */
+  /** Structured failed tool results. Codex conflates a rejection with a failure. */
   toolErrors: number;
   /** Tool calls that reported a duration, and their total wall clock. */
   toolTimed: number;
   toolDurationMs: number;
   thinkingBlocks: number;
   textBlocks: number;
-  /** A `user` record with no `tool_result` block is a person typing. Codex reports it directly. */
+  /** A human-authored user event, excluding injected and autopilot messages. */
   humanTurns: number;
   /** Agentic turns (`turn_duration` in Claude Code, task/turn lifecycle events in Codex), their wall clock and message counts. */
   turns: number;
@@ -281,14 +284,13 @@ class Acc implements RepoActivity {
 }
 
 /**
- * Accumulates repo-days across both transcript formats.
+ * Accumulates repo-days across all three transcript formats.
  *
  * The walk lives in `transcripts.ts` so that one read and one parse can feed
  * this and `capabilities.ts` together; this class is what it feeds. Claude Code
- * and Codex get a visitor each because the formats share nothing but the
- * `.jsonl` extension: Claude Code stamps `cwd` on every record, while Codex
- * declares its repo once in a session header and every later record in the file
- * inherits it, which is the per-file state `startFile` resets.
+ * Claude Code, Codex and Copilot get a visitor each because the formats share
+ * nothing but the `.jsonl` extension. Codex and Copilot declare context once
+ * and later records inherit it, which is the per-file state `startFile` resets.
  */
 export class RepoCollector {
   private readonly acc = new Map<string, Acc>();
@@ -320,6 +322,31 @@ export class RepoCollector {
 
   private readonly inRange = (date: string): boolean =>
     date.length === 10 && date >= this.options.since && date <= this.options.until;
+
+  /** Already projected VS Code request metadata, shared with capabilities. */
+  vscode(r: VsCodeRequest): void {
+    if (!r.cwd || !this.inRange(r.date)) return;
+    const repo = repoName({ cwd: r.cwd });
+    if (!repo) return;
+    const a = this.at(r.date, "copilot", repo, null);
+    a.sessionIds.add(r.sessionId);
+    a.humanTurns++;
+    a.turn(r.durationMs, r.rounds || 1);
+    a.iterations += r.rounds;
+    if (r.cancelled) a.interrupted++;
+    if (r.failed) a.apiErrors++;
+    a.facet("entrypoint", "vscode");
+    for (const u of r.usages) {
+      a.tokensIn += u.tokensIn; a.tokensOut += u.tokensOut; a.tokensCacheRead += u.tokensCacheRead;
+      a.messageCount++;
+      a.costMicros += this.priceOf(u.model, { input_tokens: u.tokensIn, output_tokens: u.tokensOut, cache_read_input_tokens: u.tokensCacheRead }, "github-copilot");
+      a.facet("model", u.model);
+    }
+    for (const tool of r.tools) {
+      a.toolCalls++;
+      a.facet("tool", tool.server ? `mcp__${tool.server}` : tool.name);
+    }
+  }
 
   /** Claude Code: cwd and gitBranch on every record. */
   claude(): TranscriptVisitor {
@@ -620,6 +647,302 @@ export class RepoCollector {
     };
   }
 
+  /** GitHub Copilot CLI: durable session events below ~/.copilot/session-state. */
+  copilot(): TranscriptVisitor {
+    const { at, inRange, priceOf } = this;
+    let repo: string | null = null;
+    let branch: string | null = null;
+    let version: string | null = null;
+    let entrypoint: string | null = null;
+    let effort: string | null = null;
+    let previousLines = { added: 0, removed: 0 };
+    let ambiguousRepo = false;
+    let hadActivity = false;
+    let sessionId: string | null = null;
+    const seenEvents = new Set<string>();
+    const turns = new Map<
+      string,
+      { acc: Acc; startedAt: number; messages: Set<string>; anonymousMessages: number }
+    >();
+    const tools = new Map<string, { acc: Acc; startedAt: number; name: string }>();
+    const hooks = new Map<string, { acc: Acc; type: string }>();
+
+    const context = (raw: unknown) => {
+      const ctx = obj(raw);
+      if (ctx.pendingGitContext === true) return;
+      const cwd = typeof ctx.cwd === "string" ? ctx.cwd : null;
+      const slug = typeof ctx.repository === "string" ? ctx.repository : null;
+      // `repository` is owner/name (or org/project/name), not a URL. Feed it
+      // through repoName as a synthetic URL so only the last name survives.
+      const nextRepo = repoName({
+        remoteUrl: slug ? `https://copilot.invalid/${slug.replace(/^\/+/, "")}` : null,
+        cwd,
+      });
+      if (hadActivity && nextRepo !== repo) ambiguousRepo = true;
+      repo = nextRepo;
+      branch = str(ctx.branch);
+    };
+
+    const current = (date: string): Acc | null =>
+      repo && inRange(date) ? at(date, "copilot", repo, branch) : null;
+
+    const applyUsage = (usage: CopilotUsageDelta) => {
+      // A cumulative checkpoint cannot divide tokens between repositories.
+      // Leave this interval unattributed instead of charging its last repo.
+      if (ambiguousRepo) return;
+      const a = current(usage.date);
+      if (!a) return;
+      if (usage.sessionId) {
+        const first = !a.sessionIds.has(usage.sessionId);
+        a.sessionIds.add(usage.sessionId);
+        if (first) {
+          a.facet("version", version);
+          a.facet("entrypoint", entrypoint ?? "copilot-cli");
+          a.facet("provider", "github-copilot");
+        }
+      }
+      a.tokensIn += usage.tokensIn;
+      a.tokensOut += usage.tokensOut;
+      a.tokensCacheRead += usage.tokensCacheRead;
+      a.tokensCacheWrite += usage.tokensCacheWrite;
+      a.tokensReasoning += usage.tokensReasoning;
+      a.messageCount += usage.messageCount;
+      a.costMicros += priceOf(usage.model, {
+        input_tokens: usage.tokensIn,
+        output_tokens: usage.tokensOut,
+        cache_read_input_tokens: usage.tokensCacheRead,
+        cache_creation_input_tokens: usage.tokensCacheWrite,
+      }, "github-copilot");
+      a.facet("model", str(usage.model), usage.messageCount || 1);
+      a.facet("effort", effort, usage.messageCount || 1);
+    };
+
+    const usageVisitor = copilotUsageVisitor(applyUsage);
+    const reset = () => {
+      repo = null;
+      branch = null;
+      version = null;
+      entrypoint = null;
+      effort = null;
+      previousLines = { added: 0, removed: 0 };
+      ambiguousRepo = false;
+      hadActivity = false;
+      sessionId = null;
+      turns.clear();
+      tools.clear();
+      hooks.clear();
+      usageVisitor.startFile?.();
+    };
+
+    return {
+      startFile: reset,
+      record: (r: Rec) => {
+        if (typeof r.id === "string") {
+          if (seenEvents.has(r.id)) return;
+          seenEvents.add(r.id);
+        }
+        if (r.agentId && ["session.start", "session.resume", "session.context_changed", "session.shutdown"].includes(String(r.type))) return;
+        const data = obj(r.data);
+        if (r.type === "session.start") {
+          sessionId = str(data.sessionId);
+          context(data.context);
+          version = str(data.copilotVersion);
+          entrypoint = str(data.producer);
+          effort = str(data.reasoningEffort);
+          usageVisitor.record(r);
+          return;
+        }
+        if (r.type === "session.context_changed") {
+          context(data);
+          usageVisitor.record(r);
+          return;
+        }
+        if (r.type === "session.resume") {
+          if (data.context) context(data.context);
+          effort = str(data.reasoningEffort) ?? effort;
+          return;
+        }
+        if (["user.message", "assistant.turn_start", "assistant.message", "tool.execution_start"].includes(String(r.type))) {
+          hadActivity = true;
+        }
+
+        // This consumes cumulative shutdown token snapshots even when the
+        // event falls before the requested range, so a later resume emits only
+        // the increase. The callback above applies in-range deltas to the repo.
+        usageVisitor.record(r);
+
+        const date = String(r.timestamp ?? "").slice(0, 10);
+        let lineDelta: { added: number; removed: number } | null = null;
+        if (r.type === "session.shutdown") {
+          const changes = obj(data.codeChanges);
+          const added = num(changes.linesAdded);
+          const removed = num(changes.linesRemoved);
+          lineDelta = {
+            added: ambiguousRepo ? 0 : Math.max(0, added - previousLines.added),
+            removed: ambiguousRepo ? 0 : Math.max(0, removed - previousLines.removed),
+          };
+          // Update even outside the range. A later in-range shutdown is a
+          // cumulative snapshot and must not repeat an earlier day's lines.
+          previousLines = { added: Math.max(added, previousLines.added), removed: Math.max(removed, previousLines.removed) };
+          ambiguousRepo = false;
+          hadActivity = false;
+        }
+        const a = current(date);
+        if (!a) return;
+        const agentId = str(r.agentId);
+        if (sessionId) a.sessionIds.add(sessionId);
+
+        if (r.type === "user.message") {
+          const source = str(data.source);
+          if (!agentId && data.isAutopilotContinuation !== true && (!source || source === "user")) {
+            a.humanTurns += 1;
+          }
+          const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+          for (const raw of attachments) a.facet("attachment", str(obj(raw).type));
+          return;
+        }
+
+        if (r.type === "assistant.message") {
+          a.textBlocks += 1;
+          if (agentId) a.sidechainMessages += 1;
+          const turnId = str(data.turnId);
+          const turn = turnId ? turns.get(`${agentId ?? "main"}|${turnId}`) : null;
+          if (turn) {
+            const messageId = str(data.messageId) ?? str(data.apiCallId);
+            if (messageId) turn.messages.add(messageId);
+            else turn.anonymousMessages += 1;
+          }
+          return;
+        }
+
+        if (r.type === "assistant.reasoning") {
+          a.thinkingBlocks += 1;
+          if (agentId) a.sidechainMessages += 1;
+          return;
+        }
+
+        if (r.type === "assistant.turn_start") {
+          const turnId = str(data.turnId);
+          if (turnId) {
+            turns.set(`${agentId ?? "main"}|${turnId}`, {
+              acc: a,
+              startedAt: Date.parse(String(r.timestamp ?? "")),
+              messages: new Set(),
+              anonymousMessages: 0,
+            });
+          }
+          return;
+        }
+
+        if (r.type === "assistant.turn_end") {
+          const turnId = str(data.turnId);
+          const key = turnId ? `${agentId ?? "main"}|${turnId}` : null;
+          const turn = key ? turns.get(key) : null;
+          if (turn) {
+            const endedAt = Date.parse(String(r.timestamp ?? ""));
+            const duration =
+              Number.isFinite(turn.startedAt) && Number.isFinite(endedAt)
+                ? Math.max(0, endedAt - turn.startedAt)
+                : 0;
+            turn.acc.turn(duration, turn.messages.size + turn.anonymousMessages);
+            if (key) turns.delete(key);
+          }
+          return;
+        }
+
+        if (r.type === "tool.execution_start") {
+          const toolCallId = str(data.toolCallId);
+          const mcp = str(data.mcpServerName);
+          const name = mcp ? `mcp__${mcp}` : (str(data.toolName) ?? "unknown");
+          a.toolCalls += 1;
+          a.facet("tool", name);
+          if (name === "web.search" || name === "web_search") a.webSearchRequests += 1;
+          if (name === "web.fetch" || name === "web_fetch") a.webFetchRequests += 1;
+          if (toolCallId) {
+            tools.set(toolCallId, {
+              acc: a,
+              startedAt: Date.parse(String(r.timestamp ?? "")),
+              name,
+            });
+          }
+          return;
+        }
+
+        if (r.type === "tool.execution_complete") {
+          const toolCallId = str(data.toolCallId);
+          const tool = toolCallId ? tools.get(toolCallId) : null;
+          if (!tool) return;
+          if (data.success !== true) tool.acc.toolErrors += 1;
+          const endedAt = Date.parse(String(r.timestamp ?? ""));
+          if (Number.isFinite(tool.startedAt) && Number.isFinite(endedAt)) {
+            tool.acc.toolTimed += 1;
+            tool.acc.toolDurationMs += Math.max(0, endedAt - tool.startedAt);
+          }
+          if (
+            data.success === true &&
+            ["apply_patch", "edit", "file.edit", "file.write", "write"].includes(
+              tool.name.toLowerCase(),
+            )
+          ) {
+            tool.acc.edits += 1;
+          }
+          if (toolCallId) tools.delete(toolCallId);
+          return;
+        }
+
+        if (r.type === "skill.invoked") {
+          // The capability visitor owns the skill details. At repo grain the
+          // event itself is a context load, not a generic tool invocation.
+          return;
+        }
+
+        if (r.type === "model.call_failure") {
+          a.apiErrors += 1;
+          return;
+        }
+
+        if (r.type === "abort") {
+          a.interrupted += 1;
+          return;
+        }
+
+        if (r.type === "session.compaction_complete") {
+          if (data.success === true) a.compactions += 1;
+          return;
+        }
+
+        if (r.type === "hook.start") {
+          const id = str(data.hookInvocationId);
+          const type = str(data.hookType) ?? "hook";
+          a.hookRuns += 1;
+          if (id) hooks.set(id, { acc: a, type });
+          return;
+        }
+
+        if (r.type === "hook.end") {
+          const id = str(data.hookInvocationId);
+          const hook = id ? hooks.get(id) : null;
+          if (hook && data.success !== true) {
+            hook.acc.hookErrors += 1;
+            hook.acc.facet("hook_error", `${hook.type} failed`);
+          }
+          if (id) hooks.delete(id);
+          return;
+        }
+
+        if (r.type === "session.model_change") {
+          effort = str(data.reasoningEffort) ?? effort;
+          return;
+        }
+
+        if (r.type === "session.shutdown") {
+          a.linesAdded += lineDelta?.added ?? 0;
+          a.linesRemoved += lineDelta?.removed ?? 0;
+        }
+      },
+    };
+  }
+
   finish(): RepoUsage[] {
     const acc = this.acc;
     return [...acc.entries()]
@@ -651,8 +974,18 @@ export class RepoCollector {
         return row;
       })
       // A tool can finish after midnight without another priced response.
-      // Preserve recorded activity while dropping directories merely opened.
-      .filter((r) => r.messageCount > 0 || ACTIVITY_KEYS.some((key) => r[key] > 0))
+      // Copilot's durable usage snapshot can omit its experimental request
+      // count while still carrying tokens. An entirely empty context is not a
+      // repo-day, but a token-bearing row remains valid with messageCount zero.
+      .filter(
+        (r) =>
+          r.messageCount > 0 ||
+          r.tokensIn > 0 ||
+          r.tokensOut > 0 ||
+          r.tokensCacheRead > 0 ||
+          r.tokensCacheWrite > 0 ||
+          ACTIVITY_KEYS.some((key) => r[key] > 0),
+      )
       // Belt and braces: nothing that still looks like a path may be reported,
       // as a repo, a branch, or a facet value.
       .filter((r) => r.repo && !looksLikePath(r.repo))
