@@ -2,6 +2,7 @@ import { looksLikePath, repoName } from "./repo.js";
 import type { UsageCounts } from "./capabilities.js";
 import { TranscriptDeduper } from "./transcript-dedup.js";
 import { codexDuration, codexItem, codexSettings, codexTool, CodexTokenReader } from "./codex.js";
+import { ClaudeTokenReader } from "./claude.js";
 import { copilotUsageVisitor, type CopilotUsageDelta } from "./copilot.js";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
 import type { VsCodeRequest } from "./vscode.js";
@@ -292,7 +293,7 @@ class Acc implements RepoActivity {
  * Accumulates repo-days across all three transcript formats.
  *
  * The walk lives in `transcripts.ts` so that one read and one parse can feed
- * this and `capabilities.ts` together; this class is what it feeds. Claude Code
+ * this and `capabilities.ts` together; this class is what it feeds.
  * Claude Code, Codex and Copilot get a visitor each because the formats share
  * nothing but the `.jsonl` extension. Codex and Copilot declare context once
  * and later records inherit it, which is the per-file state `startFile` resets.
@@ -300,6 +301,7 @@ class Acc implements RepoActivity {
 export class RepoCollector {
   private readonly acc = new Map<string, Acc>();
   private readonly claudeSeen = new TranscriptDeduper();
+  private readonly claudeTokens = new ClaudeTokenReader();
   private readonly codexSeen = new TranscriptDeduper();
   /** `repoName()` asks the disk; a transcript repeats the same cwd thousands of times. */
   private readonly repoByCwd = new Map<string, string | null>();
@@ -418,10 +420,9 @@ export class RepoCollector {
           if (stop && claudeSeen.first("stop", sessionId, requestId || null)) {
             a.facet("stop_reason", stop);
           }
-          const usage = message.usage as UsageCounts | undefined;
-          if (!usage) return;
-          if (num(usage.input_tokens) + num(usage.output_tokens) + num(usage.cache_read_input_tokens) + num(usage.cache_creation_input_tokens) === 0) return;
-          if (!claudeSeen.first("response", sessionId, requestId || null)) return;
+          const sample = this.claudeTokens.read(r, { session: sessionId, response: requestId || null });
+          if (!sample) return;
+          const usage = sample.usage;
           const u = obj(usage);
           a.tokensIn += num(u.input_tokens);
           a.tokensOut += num(u.output_tokens);

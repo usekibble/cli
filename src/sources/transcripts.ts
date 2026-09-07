@@ -86,23 +86,28 @@ export function partitionByFloor(
 }
 
 /** Parse one complete JSONL line and hand the same record to every visitor. */
-function visitLine(line: string, visitors: TranscriptVisitor[]): void {
+function visitLine(line: string, visitors: TranscriptVisitor[], strict = false): void {
   if (!line) return;
   let rec: Rec;
   try {
     rec = JSON.parse(line) as Rec;
   } catch {
+    if (strict) throw new Error("could not parse a transcript record");
     return;
   }
-  if (!rec || typeof rec !== "object" || Array.isArray(rec)) return;
+  if (!rec || typeof rec !== "object" || Array.isArray(rec)) {
+    if (strict) throw new Error("invalid transcript record");
+    return;
+  }
   for (const visitor of visitors) visitor.record(rec);
 }
 
 /**
  * Read each file once, parse each line once, hand the record to every visitor.
- * Reads are always strict: an incomplete day must never replace complete usage.
+ * File read failures always abort: incomplete days cannot replace complete usage.
+ * CI also requires valid records and bounds each line through the options below.
  */
-export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVisitor[]): void {
+export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVisitor[], options: { strict?: boolean; maxLineBytes?: number } = {}): void {
   if (visitors.length === 0) return;
   const chunk = Buffer.allocUnsafe(READ_BYTES);
   for (const file of files) {
@@ -127,6 +132,12 @@ export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVis
 
       const decoder = new StringDecoder("utf8");
       const fragments: string[] = [];
+      let lineBytes = 0;
+      const account = (fragment: string) => {
+        if (options.maxLineBytes === undefined) return;
+        lineBytes += Buffer.byteLength(fragment);
+        if (lineBytes > options.maxLineBytes) throw new Error("transcript record exceeds the collection limit");
+      };
 
       while (bytesRead > 0) {
         const text = decoder.write(chunk.subarray(0, bytesRead));
@@ -135,17 +146,23 @@ export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVis
 
         while (newline !== -1) {
           const fragment = text.slice(start, newline);
+          account(fragment);
           if (fragments.length === 0) {
-            visitLine(fragment, visitors);
+            visitLine(fragment, visitors, options.strict);
           } else {
             fragments.push(fragment);
-            visitLine(fragments.join(""), visitors);
+            visitLine(fragments.join(""), visitors, options.strict);
             fragments.length = 0;
           }
+          lineBytes = 0;
           start = newline + 1;
           newline = text.indexOf("\n", start);
         }
-        if (start < text.length) fragments.push(text.slice(start));
+        if (start < text.length) {
+          const fragment = text.slice(start);
+          account(fragment);
+          fragments.push(fragment);
+        }
 
         try {
           bytesRead = readSync(fd, chunk, 0, chunk.length, null);
@@ -157,8 +174,8 @@ export function readTranscripts(files: TranscriptFile[], visitors: TranscriptVis
       }
 
       const tail = decoder.end();
-      if (tail) fragments.push(tail);
-      if (fragments.length > 0) visitLine(fragments.join(""), visitors);
+      if (tail) { account(tail); fragments.push(tail); }
+      if (fragments.length > 0) visitLine(fragments.join(""), visitors, options.strict);
     } finally {
       closeSync(fd);
     }

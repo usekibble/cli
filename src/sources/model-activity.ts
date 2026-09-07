@@ -2,6 +2,7 @@ import type { UsageCounts } from "./capabilities.js";
 import { TranscriptDeduper } from "./transcript-dedup.js";
 import type { TranscriptVisitor } from "./transcripts.js";
 import { codexItem, codexSettings, codexTool, CodexTokenReader, count, object, text } from "./codex.js";
+import { ClaudeTokenReader } from "./claude.js";
 
 /** Counts only, at (day, agent, model). Session and tool ids stay on the machine. */
 export interface ModelActivity {
@@ -23,6 +24,7 @@ type Acc = ModelActivity & { sessionIds: Set<string> };
 export class ModelActivityCollector {
   private rows = new Map<string, Acc>();
   private seen = new TranscriptDeduper();
+  private readonly claudeTokens = new ClaudeTokenReader();
   constructor(private options: {
     since: string;
     until: string;
@@ -84,12 +86,8 @@ export class ModelActivityCollector {
         const b = object(block);
         if (b.type === "tool_use") this.tool(row, text(b.id) ?? (text(record.uuid) ? `${record.uuid}:${index}` : null), session);
       });
-      const usage = message.usage as UsageCounts | undefined;
-      if (!usage) return;
-      if (count(usage.input_tokens) + count(usage.output_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens) === 0) return;
-      const response = text(record.requestId) ?? text(message.id);
-      if (!this.seen.first("claude-code:response", session, response)) return;
-      this.usage(row, usage, session);
+      const sample = this.claudeTokens.read(record);
+      if (sample) this.usage(row, sample.usage, sample.session);
     } };
   }
 

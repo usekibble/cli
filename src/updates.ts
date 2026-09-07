@@ -310,7 +310,9 @@ export function launchCommand(args: string[]): string | undefined {
       process.env.XDG_CONFIG_HOME = value;
       index++;
     } else {
-      if (args.slice(index + 1).some((value) => value === "--config-home" || value.startsWith("--config-home="))) {
+      const separator = args.indexOf("--", index + 1);
+      const options = args.slice(index + 1, separator < 0 ? undefined : separator);
+      if (options.some((value) => value === "--config-home" || value.startsWith("--config-home="))) {
         throw new Error(t("leadingConfig"));
       }
       return arg;

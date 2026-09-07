@@ -49,6 +49,16 @@ globalThis.__kibblePricingFixture = {
   }),
   async lookupPricing(model, provider) {
     if (model === "unpriced") throw new Error("no fixture price");
+    const special = {
+      placeholder: { inputCostPerToken: 0, outputCostPerToken: 0 },
+      missingInput: { inputCostPerToken: 0, outputCostPerToken: 1e-6 },
+      missingCache: { inputCostPerToken: 1e-6, outputCostPerToken: 2e-6 },
+      invalid: { ...rates(1), inputCostPerToken: NaN },
+      negative: { ...rates(1), cacheReadInputTokenCost: -1 },
+      infinite: { ...rates(1), outputCostPerToken: Infinity },
+      huge: { ...rates(1), inputCostPerToken: Number.MAX_VALUE },
+    };
+    if (Object.hasOwn(special, model)) return { pricing: special[model] };
     const multiple = provider === "provider-a" ? 1 : provider === "provider-b" ? 2 : 3;
     return { pricing: rates(multiple) };
   },
@@ -99,6 +109,23 @@ try {
     "providerless sidecar pricing stays distinct from provider-specific core pricing",
   );
   assert.equal(sidecar("unpriced", { input_tokens: 10 }), 0);
+
+  // Unknown or invalid pricing must not turn CI spend into a reported zero.
+  await pricing.prefetch(["placeholder", "missingInput", "missingCache", "invalid", "negative", "infinite", "huge"]);
+  const empty = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const model of ["not-prefetched", "unpriced", "placeholder", "missingInput", "invalid", "negative", "infinite"]) {
+    assert.equal(pricing.knownCostMicros(model, usage), null, `${model} has no safe CI estimate`);
+    assert.equal(pricing.knownCostMicros(model, empty), null, `${model} cannot establish even a zero estimate`);
+  }
+  assert.equal(pricing.knownCostMicros("huge", usage), null, "overflow must not be reported as zero");
+  assert.equal(pricing.knownCostMicros("missingCache", usage), null, "used cache buckets need explicit rates");
+  assert.equal(pricing.knownCostMicros("missingCache", { ...empty, input: 10, output: 20 }), 50);
+  assert.equal(pricing.knownCostMicros("fixture-model", empty), 0, "known rates establish zero-token cost");
+  assert.equal(pricing.knownCostMicros("fixture-model", usage), 900);
+  assert.equal(pricing.knownCostMicros({ model: "fixture-model", provider: "provider-a" }, usage), 300);
+  assert.equal(pricing.knownCostMicros("fixture-model", { ...usage, input: -1 }), null);
+  assert.equal(pricing.costMicros("missingCache", usage), 90, "legacy cache fallbacks remain unchanged");
+  assert.equal(pricing.costMicros("placeholder", usage), 0, "legacy unknown-price behavior remains unchanged");
 } finally {
   delete globalThis.__kibblePricingFixture;
   rmSync(home, { recursive: true, force: true });

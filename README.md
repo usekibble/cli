@@ -136,6 +136,255 @@ recovery fixtures and compares the default collector against raw
 Claude totals. An empty window or a parser outside the accuracy tolerance
 fails the check. It does not establish every agent's transcript accuracy.
 
+## CI collection
+
+CI supports ordinary agents that save sessions and ephemeral agents that do not.
+Both use the same write-only automation credentials and counts-only receipts.
+
+| Agent workflow | Collection |
+| --- | --- |
+| Normal Codex or Claude Code with saved native sessions | `kibble ci collect` after the agent stops |
+| Ephemeral invocation without saved sessions | `kibble run` around the invocation |
+| Retry a previously collected result | `kibble ci upload` with the saved receipts |
+
+### Normal agents with saved sessions
+
+Keep the existing agent invocation, including its normal terminal output. In a
+final CI step, scan the **isolated session directory for this job**:
+
+```sh
+kibble ci collect --agent codex --sessions-dir "$RUNNER_TEMP/codex/sessions" \
+  --receipts-dir "$RUNNER_TEMP/kibble-receipts" --upload
+
+# Or, for Claude Code:
+kibble ci collect --agent claude-code --sessions-dir "$RUNNER_TEMP/claude/projects" \
+  --receipts-dir "$RUNNER_TEMP/kibble-receipts" --upload
+```
+
+Configure and authenticate the agent in that job's fresh home before it runs.
+Codex uses `CODEX_HOME`; pass its `sessions` directory to collection. To include
+archived sessions too, a job-only Codex home can be the collection root. Claude
+Code uses `CLAUDE_CONFIG_DIR`; pass its `projects` directory. Never point this CI
+step at a reused runner's entire personal history. Kibble requires an explicit
+directory and does not infer a safe job boundary from a date or file mtime.
+The [Claude directory reference](https://code.claude.com/docs/en/claude-directory)
+documents its session and subagent locations.
+
+A GitHub Actions job with Codex installed and authenticated in its isolated
+`CODEX_HOME` can keep these steps:
+
+```yaml
+env:
+  CODEX_HOME: ${{ runner.temp }}/codex
+
+steps:
+  # Install the pinned CLIs and authenticate Codex in CODEX_HOME first.
+  - name: Run the coding agent
+    run: codex exec "Run the tests and report failures"
+
+  - name: Collect saved sessions, including after agent failure
+    if: ${{ always() }}
+    env:
+      KIBBLE_CI_TOKEN: ${{ secrets.KIBBLE_CI_TOKEN }}
+    run: >-
+      kibble ci collect --agent codex
+      --sessions-dir "$CODEX_HOME/sessions"
+      --receipts-dir "$RUNNER_TEMP/kibble-receipts" --upload
+```
+
+Without `--upload`, collection needs no Kibble login or credential. It writes one
+private JSON receipt per session, named by its opaque stable id. The default
+output directory is `.kibble-ci-receipts` inside `--sessions-dir`. Retain the
+receipt directory as a CI artifact if delivery fails and retry, for example:
+
+```sh
+kibble ci upload "$RUNNER_TEMP/kibble-receipts/"*.json
+```
+
+The native session id is reduced to a stable hash-based UUID; filenames, paths
+and raw session ids are not sent. Copies of the same session retain their id,
+and repeated token snapshots or Claude response blocks count once. Appended
+usage replaces the earlier session snapshot using a revision derived from the
+observed counters. A new session has a new id and adds usage. Recollecting
+unchanged usage keeps its saved price estimate; upload the saved receipt when
+retrying delivery. Conflicting snapshots and regressing counters or known cost
+are refused. Use one connection and collection mode per session. When a stream
+and a file receipt identify the same session, the server rejects the overlap
+instead of adding it twice. Older stream receipts without session identity
+cannot establish this match; do not import their executions again from files.
+
+Files report observed tokens, recorded model names, supported tool counts and
+list-price token estimates when every used bucket has a known price. This is
+not an invoice and does not include unrecorded usage or separate tool charges.
+Missing prices stay unknown. Completion, process exit and elapsed duration stay
+unknown: a closed file does not prove a successful or fully flushed run. Usage
+is labelled partial even when the file parses cleanly. Claude subagent files
+under the selected root are included; Codex child sessions are separate receipts
+when their files are present. No missing child usage is inferred.
+
+Collect after all agents writing to the directory have stopped. Missing or empty
+inputs, malformed records, missing identities, oversized lines and symlinks fail
+collection before upload. A session with no observed token usage produces an
+unavailable receipt and a nonzero collection exit. Keep the agent and collection
+as separate CI steps so the collector cannot hide the agent's failure. Collection
+supports at most 100 sessions, 10,000 JSONL files, one million records and 8 MiB
+per record per invocation. Concurrent writes to one receipt directory are
+refused; after a killed collector, remove `.collect.lock` only once it has stopped.
+
+### Ephemeral agent runs
+
+`kibble run` captures a fresh Codex or Claude Code invocation into a local,
+counts-only JSON receipt. It works without saved agent sessions, Kibble login
+or a scheduler. Add `--upload` to deliver the receipt immediately, or use
+`kibble ci upload` in a final CI step. `kibble push` continues to collect laptop
+transcripts and does not import run receipts. These commands require the CLI
+build containing CI support and a server with the CI migration and routes deployed.
+
+```sh
+kibble run --receipt codex-usage.json -- codex exec --model <model> "Run the tests and report failures"
+kibble run --receipt claude-usage.json -- claude -p --model haiku "Run the tests and report failures"
+```
+
+An organization owner creates a connection under **Settings → CI connections**,
+optionally assigns it to a team, and copies its credential into the CI secret
+store as `KIBBLE_CI_TOKEN`. Credentials are write-only and never expire. Owners can rotate or revoke them
+at any time. Rotation immediately invalidates the previous token. The server stores only their hashes.
+They cannot read dashboard data, impersonate an engineer, or allocate a device.
+Rotation keeps the connection and its history while invalidating the old secret.
+Revocation stops delivery and retains historical usage. Team attribution is
+fixed when creating the connection; create a new connection for a different team.
+
+```sh
+# With KIBBLE_CI_TOKEN supplied by your secret store:
+kibble run --receipt usage.json --upload -- codex exec --model <model> "Run the tests"
+# Retry delivery without another agent invocation:
+kibble ci upload usage.json
+```
+
+`KIBBLE_SERVER` or `--server` selects a self-hosted server origin. The default is
+`https://app.usekibble.com`. HTTPS is required except on localhost for development.
+The uploader never follows redirects with credentials and retries transient
+network/server failures up to four attempts, with a ten-second request timeout.
+It validates the entire strict receipt before sending it. Raw agent logs and
+JSON with unknown fields are rejected. `kibble run` removes `KIBBLE_CI_TOKEN` from the child agent's environment.
+
+With this CLI build and the agent already installed and authenticated, the core
+GitHub Actions steps are:
+
+```yaml
+- name: Run the coding agent
+  run: kibble run --receipt "$RUNNER_TEMP/kibble-ci.json" -- codex exec "Run the tests and report failures"
+
+- name: Deliver usage, including failed runs
+  if: ${{ always() }}
+  env:
+    KIBBLE_CI_TOKEN: ${{ secrets.KIBBLE_CI_TOKEN }}
+  run: kibble ci upload "$RUNNER_TEMP/kibble-ci.json"
+```
+
+Pin the Kibble and agent versions in the job's installation steps. Use one
+receipt path per invocation. For parallel jobs, their runner-local temporary
+directories and random run ids separate their usage. Retain the counts-only
+receipt as a CI artifact in another `always()` step when delivery fails, then
+retry `kibble ci upload` with that file. The wrapper preserves nonzero agent
+exits, so collecting usage does not turn a failed job into a successful one.
+A missing receipt is an upload failure, never a successful zero-usage report.
+
+Each receipt has an increasing `revision`. Uploading the same revision again
+returns a duplicate acknowledgement. A late checkpoint cannot overwrite a newer
+receipt, and a finalized execution cannot be amended by a new revision. Conflicting
+content at the same revision fails. Actual reruns create a fresh run id and add
+their usage. Receipt timestamps and agent identity cannot change across revisions.
+
+Owners see all CI runs; managers see connections assigned to their managed teams.
+A team dashboard links to its CI report and preserves the selected time and agent.
+Personal scopes contain no automation usage. The Overview summary and **CI usage**
+report show reported estimates, missing prices and incomplete runs. These figures
+are separate from the existing reconciled vendor/laptop total because receipts
+lack a reliable vendor billing identity for deduplication. The report includes
+the latest 100 runs in the selected window; its summary counts every matching run.
+Runs use their UTC start date, including jobs that cross midnight. Reads, uploads
+and the daily retention purge use the organization's history window.
+
+In a source checkout, replace `kibble` with `pnpm --filter @usekibble/cli dev`.
+Put Kibble options before `--`, followed by the agent executable and its arguments.
+Use the agent's own installed credentials and permissions. Kibble adds
+`--ephemeral --json` for Codex and
+`-p --no-session-persistence --output-format stream-json --verbose` for Claude.
+It does not relax the agent's sandbox or tool permissions. Text input on stdin
+is inherited. Use native agent executables on Windows; shell scripts and `.cmd`
+shims are not supported by the wrapper. Resumed conversations, `codex exec review`
+and Claude streaming input are refused because their accounting boundaries differ.
+
+The receipt contains a random execution id and revision, agent, UTC start/end times, elapsed
+time, process exit/signal, structured result status, token buckets, observed tool
+call/error counts, and fixed collection issue codes. Claude adds per-model usage
+and an agent-reported cost estimate, rounded once into integer microdollars.
+Model attribution comes only from usage records, never from scanning command
+arguments which can also contain prompts. No prompt, answer, command, tool argument/output,
+path, session transcript, account identifier or environment value is retained.
+Model names are filtered to bounded identifiers. Agent stdout and stderr are
+consumed and discarded, so neither becomes a CI log or artifact through Kibble.
+Agent features that write their own files or telemetry remain controlled by the
+agent's configuration. If a workflow needs the final answer, configure an output
+file through the agent itself and treat that file as content, separate from the
+Kibble receipt.
+
+| Field | Meaning |
+| --- | --- |
+| `usageStatus: complete` | A valid final usage snapshot was observed for the receipt's `accountingScope`, with no collection issue. This does not mean every kind of usage is available. |
+| `usageStatus: partial` | Some usage was observed, but interruption, malformed output or limited accounting prevents a complete receipt. |
+| `usageStatus: unavailable` | No usable usage snapshot was observed. Token totals are `null`, never invented zeros. |
+| `costMicros: null` | Cost is unavailable. A successful Codex run currently has this value. |
+| `costBasis: agent_estimate` | Claude's reported estimate, not an invoice or subscription charge. |
+| `outcome` | `running`, `succeeded`, `failed`, `interrupted` or `launch_failed`, separately from usage completeness. |
+
+Codex completion usage covers the main thread. It has no verified model breakdown
+or price, and child-agent spend is not established by this stream. Claude uses
+the final `modelUsage` object, whose documented scope includes subagents; it never
+sums preliminary assistant usage with final totals. Older results with only
+top-level `usage` are marked partial. Repeated cumulative results replace earlier
+snapshots instead of adding to them. Reasoning is a subset of Codex output;
+Claude reasoning counts remain unknown. Tool counters describe supported events
+observed in the stream, not a complete inventory of skills, MCP servers or
+subagent activity. Receipts are run totals, not per-day attribution for jobs
+crossing midnight.
+
+The destination must be a new file in an existing writable directory. Kibble
+reserves it before launching the agent and writes private, atomic checkpoints
+at most twice a second when events arrive. A new execution gets a new `runId`;
+keep that receipt unchanged when retrying artifact delivery. Choose a separate
+file for every invocation and parallel job. Reusing a filename fails before the
+agent runs, so it cannot erase an earlier receipt.
+
+On macOS/Linux, SIGINT and SIGTERM are forwarded to the child process group,
+followed by SIGKILL after ten seconds if it has not exited. Windows uses Node's
+child termination behavior, without a process-tree cleanup guarantee. A hard
+kill or destroyed runner can leave only the latest checkpoint, with
+`outcome: running`, and can lose usage not yet emitted by the agent. Retain the
+receipt in an `always()` artifact step while the runner still exists. Do not
+upload the agent's raw JSON stream.
+
+Nonzero child exit codes are preserved. Signal termination returns `128 + signal`.
+If the child exits zero but reports an agent failure, or collection is incomplete,
+Kibble exits 1. This catches Claude's observed error result with an OS exit of zero.
+Receipt write failures also fail collection. A Codex run can succeed with complete
+main-thread tokens and an unavailable cost; workflows requiring a price must
+check `costMicros` explicitly.
+
+The synthetic collection suite covers repeated totals, cache normalization,
+missing/invalid usage, content exclusion, process failures, private receipt files
+and POSIX interruption. The server ingest check also exercises capture, HTTP upload,
+concurrent retries, credential rotation/revocation, scope and retention through
+production functions against a throwaway local organization. Live agent validation
+uses Codex 0.153.4 and Claude Code 2.1.261
+on macOS. Actual Windows/Linux runners, resumed sessions and vendor invoice
+reconciliation are outside that live validation.
+
+Format references: [Codex noninteractive mode](https://learn.chatgpt.com/docs/non-interactive-mode),
+[Claude CLI](https://code.claude.com/docs/en/cli-reference),
+[Claude cost tracking](https://code.claude.com/docs/en/agent-sdk/cost-tracking).
+
 ## Cross-platform CI
 
 The public repository runs `CLI checks` on pull requests and pushes to main,

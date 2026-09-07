@@ -16,6 +16,7 @@ await import("./verify-plans.mjs");
 await import("./verify-lock.mjs");
 await import("./verify-schedule.mjs");
 await import("./verify-updates.mjs");
+await import("./verify-ci-run.mjs");
 // Adapter fixtures replace module loading, so each needs a fresh module cache.
 for (const fixture of ["verify-login.mjs", "verify-push.mjs", "verify-pricing.mjs"]) {
   const checked = spawnSync(process.execPath, [fileURLToPath(new URL(fixture, import.meta.url))], { encoding: "utf8" });

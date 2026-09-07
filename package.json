@@ -1,6 +1,6 @@
 {
   "name": "@usekibble/cli",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "The Kibble collector: reports Claude Code, Codex and Copilot usage, per engineer, team, model and repo. Counts only, never prompts, code or paths.",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-launcher.mjs",
@@ -45,7 +45,8 @@
     "semver": "7.8.5",
     "smol-toml": "1.8.0",
     "sql.js": "^1.14.2",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^20",

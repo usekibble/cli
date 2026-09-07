@@ -33,13 +33,18 @@ function keyOf(value: string | PricingRef): string {
   return JSON.stringify([provider, model]);
 }
 
-/** Apply native per-token rates and round once at the integer-money boundary. */
-export function pricedCostMicros(usage: PricedUsage, rates: Rates): number {
-  const dollars =
+function pricedDollars(usage: PricedUsage, rates: Rates): number {
+  return (
     usage.input * rates.inputCostPerToken +
     usage.output * rates.outputCostPerToken +
     usage.cacheRead * (rates.cacheReadInputTokenCost ?? 0) +
-    usage.cacheWrite * (rates.cacheCreationInputTokenCost ?? rates.inputCostPerToken);
+    usage.cacheWrite * (rates.cacheCreationInputTokenCost ?? rates.inputCostPerToken)
+  );
+}
+
+/** Apply native per-token rates and round once at the integer-money boundary. */
+export function pricedCostMicros(usage: PricedUsage, rates: Rates): number {
+  const dollars = pricedDollars(usage, rates);
   return Number.isFinite(dollars) ? Math.round(dollars * 1_000_000) : 0;
 }
 
@@ -85,6 +90,22 @@ export class PricingContext {
 
   costMicros(value: string | PricingRef, usage: PricedUsage): number {
     return pricedCostMicros(usage, this.rates.get(keyOf(value)) ?? ZERO);
+  }
+
+  /** A CI estimate is unknown unless every used token bucket has a valid rate. */
+  knownCostMicros(value: string | PricingRef, usage: PricedUsage): number | null {
+    const rates = this.rates.get(keyOf(value));
+    if (!rates || !Object.values(usage).every((count) => Number.isSafeInteger(count) && count >= 0)) return null;
+    // The native API turns missing base rates into zero, with no presence flag.
+    // Require positive base rates so those placeholders cannot look free.
+    if (![rates.inputCostPerToken, rates.outputCostPerToken].every((rate) => Number.isFinite(rate) && rate > 0)) return null;
+    for (const rate of [rates.cacheReadInputTokenCost, rates.cacheCreationInputTokenCost]) {
+      if (rate !== undefined && (!Number.isFinite(rate) || rate < 0)) return null;
+    }
+    if (usage.cacheRead > 0 && rates.cacheReadInputTokenCost === undefined) return null;
+    if (usage.cacheWrite > 0 && rates.cacheCreationInputTokenCost === undefined) return null;
+    const micros = Math.round(pricedDollars(usage, rates) * 1_000_000);
+    return Number.isSafeInteger(micros) && micros >= 0 ? micros : null;
   }
 }
 

@@ -4,6 +4,9 @@ import { readFileSync } from "node:fs";
 import { Command, Option } from "commander";
 import { login, logout } from "./commands/login.js";
 import { push } from "./commands/push.js";
+import { run } from "./commands/run.js";
+import { ciUpload } from "./commands/ci.js";
+import { ciCollect } from "./commands/ci-collect.js";
 import { scheduleInstall, scheduleStatus, scheduleUninstall } from "./commands/schedule.js";
 import { skillInstall, skillShow, skillUninstall } from "./commands/skill.js";
 import { usage } from "./commands/usage.js";
@@ -14,6 +17,7 @@ import { usageText } from "./usage-messages.js";
 import { updateText } from "./update-messages.js";
 
 const program = new Command();
+program.enablePositionalOptions();
 
 program
   .name("kibble")
@@ -60,6 +64,32 @@ program
   .option("--quiet", "print one line per run (used by the hourly schedule)")
   .description("send daily usage aggregates")
   .action(async (opts) => { await push(opts); });
+
+program
+  .command("run")
+  .argument("<agent-command...>")
+  .option("--receipt <file>", "new counts-only JSON receipt file (required)")
+  .option("--upload", "upload the receipt with KIBBLE_CI_TOKEN, including failed runs")
+  .option("--server <url>", "Kibble server origin (or KIBBLE_SERVER)")
+  .passThroughOptions()
+  .allowUnknownOption()
+  .description("capture a fresh ephemeral Codex or Claude run into a counts-only receipt")
+  .action(run);
+
+const ci = program.command("ci").description("CI session collection and receipt delivery");
+ci.command("collect")
+  .requiredOption("--agent <agent>", "codex or claude-code")
+  .requiredOption("--sessions-dir <directory>", "job-only directory of native JSONL session files")
+  .option("--receipts-dir <directory>", "counts-only artifacts (default: .kibble-ci-receipts inside sessions-dir)")
+  .option("--upload", "upload the saved receipts with KIBBLE_CI_TOKEN")
+  .option("--server <url>", "Kibble server origin (or KIBBLE_SERVER)")
+  .description("collect saved Codex or Claude sessions after the agent stops")
+  .action(ciCollect);
+ci
+  .command("upload <receipts...>")
+  .option("--server <url>", "Kibble server origin (or KIBBLE_SERVER)")
+  .description("upload or retry saved receipts with KIBBLE_CI_TOKEN; never rerun agents")
+  .action(ciUpload);
 
 program
   .command("usage")
