@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { copilotCapabilityName, readCopilotConfig } from "./copilot-config.js";
+import { vsCodeCapabilityInventory, vsCodeCapabilityInvocations } from "./vscode-capabilities.js";
+import { vsCodeDataDirs } from "./vscode.js";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
 import { TranscriptDeduper } from "./transcript-dedup.js";
 import { codexItem, codexSettings } from "./codex.js";
@@ -64,6 +66,8 @@ export type CapabilityKind = "skill" | "command" | "mcp";
 /** Which agent the row is a fact about. Every capability row carries one. */
 export type CapabilityAgent = "claude-code" | "codex" | "copilot";
 
+export type CapabilityMetricKey = "invocations" | "triggerTyped" | "triggerModel" | "contextTokens" | "descriptionTokens" | "attributedTurns" | "attributedTokens" | "attributedCostMicros";
+
 export interface UsageCounts {
   input_tokens?: number;
   output_tokens?: number;
@@ -72,6 +76,8 @@ export interface UsageCounts {
 }
 
 export interface CapabilityRecord {
+  /** Closed metric names only; unknown is distinct from no recorded use. */
+  unavailableMetrics?: CapabilityMetricKey[];
   agent: CapabilityAgent;
   date: string;
   kind: CapabilityKind;
@@ -587,19 +593,19 @@ function bucket(): Bucket {
  * command and awaited-body state reset in `startFile`.
  */
 export class CapabilityCollector {
+  private readonly vscodeRequests: VsCodeRequest[] = [];
+  private readonly vscodeCounted = new Set<string>();
+  // Inventory rows anchor to the latest active day, and a fired artifact has
+  // no separate idle row. Coverage therefore follows the whole scanned window;
+  // finish also persists it on each VS Code day so later pushes cannot erase it.
+  private readonly vscodeCoverage = new Map<CapabilityKind, Set<CapabilityMetricKey>>();
+  private copilotCliActive = false;
   private readonly claudeSeen = new TranscriptDeduper();
   private readonly codexSeen = new TranscriptDeduper();
   /** No tool arguments or skill bodies: only explicitly serialized names. */
   vscode(r: VsCodeRequest): void {
-    if (r.cwd) this.copilotCwds.add(r.cwd);
     this.active("copilot", r.date);
-    if (r.command) {
-      const bucket = this.at("copilot", r.date, "command", r.command);
-      bucket.invocations++; bucket.triggerTyped++;
-    }
-    for (const tool of r.tools) {
-      if (tool.server) this.at("copilot", r.date, "mcp", tool.server).invocations++;
-    }
+    this.vscodeRequests.push(r);
   }
   /** key: `${agent}|${date}|${kind}|${name}` */
   private readonly seen = new Map<string, Bucket>();
@@ -624,6 +630,7 @@ export class CapabilityCollector {
     until: string;
     home?: string;
     copilotHome?: string;
+    vscodeUserDataDirs?: string[];
     /** Cost in micros for one record's usage, so rates match Lane A exactly. */
     priceOf?: (model: string, u: UsageCounts) => number;
   }) {
@@ -925,6 +932,7 @@ export class CapabilityCollector {
           record.type === "skill.invoked" ||
           record.type === "tool.execution_start"
         ) {
+          this.copilotCliActive = true;
           active("copilot", date);
         }
 
@@ -961,10 +969,52 @@ export class CapabilityCollector {
 
   finish(): CapabilityRecord[] {
     const { home, cwds, copilotCwds, copilotHome, seen, activeDates } = this;
+    const cliInventory = this.copilotCliActive ? copilotInventory(home, copilotCwds, copilotHome) : { skills: new Map<string, InstalledCapability>(), commands: new Map<string, InstalledCapability>() };
+    const editorInventory = this.vscodeRequests.length ? vsCodeCapabilityInventory({
+      home,
+      cwds: this.vscodeRequests.flatMap((r) => r.cwd ? [r.cwd] : []),
+      userDataDirs: this.options.vscodeUserDataDirs ?? vsCodeDataDirs({ home }),
+    }) : null;
+    if (editorInventory) for (const r of this.vscodeRequests) {
+      const key = `${r.sessionId}|${r.requestId}`;
+      if (this.vscodeCounted.has(key)) continue;
+      this.vscodeCounted.add(key);
+      for (const invocation of vsCodeCapabilityInvocations(r, editorInventory)) {
+        const b = this.at("copilot", r.date, invocation.kind, invocation.name);
+        b.invocations++;
+        if (invocation.trigger === "typed") b.triggerTyped++;
+        if (invocation.trigger === "model") b.triggerModel++;
+      }
+      for (const kind of ["skill", "command", "mcp"] as const) {
+        const key = kind;
+        const missing = this.vscodeCoverage.get(key) ?? new Set<CapabilityMetricKey>();
+        for (const metric of ["contextTokens", "attributedTurns", "attributedTokens", "attributedCostMicros"] as const) missing.add(metric);
+        // VS Code serializes tool result content but drops automatic skill
+        // metadata. A typed selection is observable, the total skill use isn't.
+        if (kind === "skill") { missing.add("invocations"); missing.add("triggerModel"); }
+        if (r.promptNames.some((name) => !editorInventory.commands.has(name) && !editorInventory.typedSkills.has(name)) && kind !== "mcp") {
+          missing.add("triggerTyped"); missing.add("invocations");
+        }
+        if (kind === "mcp") {
+          missing.add("triggerTyped"); missing.add("triggerModel");
+          if (r.tools.some((tool) => !tool.server && tool.name.startsWith("mcp_"))) missing.add("invocations");
+        }
+        this.vscodeCoverage.set(key, missing);
+      }
+    }
+    const copilotInstalled: Inventory = { skills: new Map(cliInventory.skills), commands: new Map(cliInventory.commands) };
+    if (editorInventory) for (const kind of ["skills", "commands"] as const) {
+      const claimed = new Set([...copilotInstalled[kind].values()].map((entry) => entry.realPath));
+      for (const [name, entry] of editorInventory[kind]) {
+        if (copilotInstalled[kind].has(name)) continue;
+        copilotInstalled[kind].set(name, { ...entry, ...(claimed.has(entry.realPath) ? { alias: true } : {}) });
+        claimed.add(entry.realPath);
+      }
+    }
     const inventories: Record<CapabilityAgent, Inventory> = {
       "claude-code": inventory(home, cwds),
       codex: this.codexInstalled(),
-      copilot: copilotInventory(home, copilotCwds, copilotHome),
+      copilot: copilotInstalled,
     };
 
     const out: CapabilityRecord[] = [];
@@ -1044,6 +1094,37 @@ export class CapabilityCollector {
       }
     }
 
+    // Persist uncertainty on the day it arose. Window-wide flags on a later
+    // CLI row alone would be replaced by a future push that excludes this VS
+    // Code day. Zero here is the observed count, explicitly marked incomplete,
+    // not a claim that an installed capability did not fire.
+    const copilotTemplates = new Map<string, CapabilityRecord>();
+    const copilotGrains = new Set<string>();
+    for (const row of out) if (row.agent === "copilot") {
+      const key = `${row.kind}|${row.name}`;
+      copilotTemplates.set(key, row);
+      copilotGrains.add(`${row.date}|${key}`);
+    }
+    for (const date of new Set(this.vscodeRequests.map((request) => request.date))) {
+      for (const [key, template] of copilotTemplates) {
+        const grain = `${date}|${key}`;
+        if (copilotGrains.has(grain) || !this.vscodeCoverage.get(template.kind)?.size) continue;
+        out.push({
+          ...template, date, invocations: 0, triggerTyped: 0, triggerModel: 0,
+          contextTokens: 0, attributedTurns: 0, attributedTokens: 0,
+          attributedCostMicros: 0,
+        });
+        copilotGrains.add(grain);
+      }
+    }
+
+    for (const row of out) if (row.agent === "copilot") {
+      const missing = new Set(this.vscodeCoverage.get(row.kind) ?? []);
+      for (const key of ["attributedTurns", "attributedTokens", "attributedCostMicros"] as const) missing.add(key);
+      // Ordinary Copilot CLI command events are ephemeral, unlike skill events.
+      if (this.copilotCliActive && row.kind === "command") for (const key of ["invocations", "triggerTyped", "triggerModel", "contextTokens"] as const) missing.add(key);
+      row.unavailableMetrics = [...missing].sort();
+    }
     return out.sort(
       (a, b) => a.date.localeCompare(b.date) || b.invocations - a.invocations,
     );

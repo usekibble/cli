@@ -165,7 +165,11 @@ export const ACTIVITY_KEYS = [
   "hookErrors",
 ] as const satisfies readonly (keyof RepoActivity)[];
 
+export type RepoMetricKey = keyof RepoActivity | "tokensIn" | "tokensOut" | "tokensCacheRead" | "tokensCacheWrite" | "messageCount" | "costMicros";
+
 export interface RepoUsage extends RepoActivity {
+  /** Names only. Missing observations must never be interpreted as zero. */
+  unavailableMetrics?: RepoMetricKey[];
   date: string;
   agent: string;
   repo: string;
@@ -206,6 +210,7 @@ function str(v: unknown): string | null {
 }
 
 class Acc implements RepoActivity {
+  readonly unavailableMetrics = new Set<RepoMetricKey>();
   tokensIn = 0;
   tokensOut = 0;
   tokensCacheRead = 0;
@@ -329,10 +334,17 @@ export class RepoCollector {
     const repo = repoName({ cwd: r.cwd });
     if (!repo) return;
     const a = this.at(r.date, "copilot", repo, null);
+    for (const metric of r.unavailableMetrics) a.unavailableMetrics.add(metric as RepoMetricKey);
     a.sessionIds.add(r.sessionId);
-    a.humanTurns++;
+    if (r.humanInitiated) a.humanTurns++;
     a.turn(r.durationMs, r.rounds || 1);
     a.iterations += r.rounds;
+    a.textBlocks += r.textBlocks;
+    a.thinkingBlocks += r.thinkingBlocks;
+    a.hookRuns += r.hookRuns;
+    a.hookErrors += r.hookErrors;
+    a.compactions += r.compactions;
+    a.tokensReasoning += r.tokensReasoning;
     if (r.cancelled) a.interrupted++;
     if (r.failed) a.apiErrors++;
     a.facet("entrypoint", "vscode");
@@ -344,6 +356,13 @@ export class RepoCollector {
     }
     for (const tool of r.tools) {
       a.toolCalls++;
+      if (tool.outcome === "error") a.toolErrors++;
+      if (tool.outcome === "cancelled") a.interrupted++;
+      if (tool.durationMs !== null) {
+        a.toolTimed++;
+        a.toolDurationMs += tool.durationMs;
+      }
+      if (tool.sandboxBypass) a.sandboxDisabled++;
       a.facet("tool", tool.server ? `mcp__${tool.server}` : tool.name);
     }
   }
@@ -683,8 +702,14 @@ export class RepoCollector {
       branch = str(ctx.branch);
     };
 
-    const current = (date: string): Acc | null =>
-      repo && inRange(date) ? at(date, "copilot", repo, branch) : null;
+    const current = (date: string): Acc | null => {
+      if (!repo || !inRange(date)) return null;
+      const row = at(date, "copilot", repo, branch);
+      // These Claude-specific counters have no decoded Copilot CLI field.
+      // Union with editor coverage when both sources share this repo/day.
+      for (const key of ["iterations", "hunks", "tokensCacheWrite1h", "tokensCacheWrite5m", "userModified", "sandboxDisabled"] as const) row.unavailableMetrics.add(key);
+      return row;
+    };
 
     const applyUsage = (usage: CopilotUsageDelta) => {
       // A cumulative checkpoint cannot divide tokens between repositories.
@@ -967,6 +992,7 @@ export class RepoCollector {
           tokensCacheWrite: a.tokensCacheWrite,
           messageCount: a.messageCount,
           costMicros: a.costMicros,
+          ...(agent === "copilot" ? { unavailableMetrics: [...a.unavailableMetrics].sort() } : {}),
           facets,
           ...Object.fromEntries(ACTIVITY_KEYS.map((k) => [k, a[k]])),
           sessions: a.sessionIds.size,
@@ -1001,7 +1027,8 @@ export class RepoCollector {
 
 /** A one-line, human-readable digest of what the scan found. Never sent. */
 export function summarizeRepos(rows: RepoUsage[]): string[] {
-  const sum = (k: keyof RepoActivity) => rows.reduce((s, r) => s + r[k], 0);
+  const sum = (k: keyof RepoActivity) => rows.some((r) => r.unavailableMetrics?.includes(k))
+    ? "unavailable" : rows.reduce((s, r) => s + r[k], 0);
   const repos = new Set(rows.map((r) => r.repo)).size;
   const out = [`  repos: ${repos} (names only, never paths)`];
   if (rows.length === 0) return out;

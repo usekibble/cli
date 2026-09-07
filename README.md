@@ -323,6 +323,38 @@ the input rate. Prices are model-list estimates, not Copilot AI credits or
 invoices. Unrecorded inline completions, remote-only sessions, skill-token
 attribution, and subscription-tier detection are not supplied by this adapter.
 
+VS Code does not yet provide the same activity coverage as Claude Code:
+
+| Metric | Saved VS Code chat coverage |
+| --- | --- |
+| Tool calls | Structured call IDs and names, deduplicated across rounds and cards |
+| Tool pass/fail | Explicit saved errors and terminal exit codes only; a completed card is not proof of success |
+| Interruptions | Explicit cancellation flags and tool denials count; a saved Cancelled state alone can represent unfinished work and remains unknown |
+| Tool duration | Saved terminal/subagent timers, plus uniquely joined start/end intervals from existing extension transcripts; these can include approval waiting and remain incomplete |
+| Manual skill/command triggers | Explicit selections and names resolved against local inventory |
+| Automatic skill triggers | Unavailable: ordinary result serialization drops skill metadata |
+| Hook failures and compactions | Observed hook/compaction markers, not complete execution totals; a hook policy block does not prove an execution failure |
+| Edits and added/removed lines | Unavailable without reading content, which this collector does not do |
+| Skill-attributed tokens and cost | Unavailable |
+
+Repository and capability rows carry closed-enum `unavailableMetrics` flags.
+Their observed numeric values are not complete totals when flagged. The server
+preserves that distinction through aggregate cards, reports and skill rankings;
+missing measurements must not become zero failures or "never used" skills.
+Daily usage totals still represent the available token estimate, not a claim of
+complete loop coverage. Deploy the matching server schema before releasing a
+collector that sends these flags.
+
+VS Code capability discovery respects supported local skill/prompt locations,
+configured plugin roots, workspace settings and disabled entries in profile
+storage. Plugin workspace enablement overrides profile enablement. It reads fixed keys
+from a bounded, in-memory SQLite copy without changing the editor database.
+Prompt locations ending in a sole `/*` use immediate-child folder discovery;
+other search globs remain unsupported. Extension-provided artifacts, remote
+workspaces, marketplace discovery, multi-root
+settings and historical profile selection are not exhaustively covered. No
+telemetry settings are changed to fill these gaps.
+
 For development, `pnpm verify` also exercises Copilot schema fixtures for
 resume, VS Code mutation replay, deduplication, privacy and repository
 attribution before the existing Claude Code raw-transcript comparison. The
