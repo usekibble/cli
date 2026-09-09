@@ -487,7 +487,10 @@ working-directory paths or bodies. They describe the last observed inventory;
 changes since that hook, untouched project subdirectories and plugin inventory
 remain unobserved. Snapshots outside the collection window are excluded.
 Explicit command and manually selected skill metadata is read from Cursor's
-local database in a read-only snapshot. Selections count once per message and
+local database in a read-only snapshot. One short-lived reader process owns that
+snapshot so native SQLite handles are released before collection continues,
+including after corrupt data. Its output is bounded and contains artifact hashes
+instead of selected paths. Selections count once per message and
 name, using recorded timestamps. Skill paths are resolved to inventory names
 locally and never uploaded. Expanded commands and content are not decoded.
 This path has synthetic coverage; a live selected-skill control is still pending.

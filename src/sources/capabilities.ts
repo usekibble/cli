@@ -736,7 +736,7 @@ export class CapabilityCollector {
   }
 
   /** Explicit selections and completed MCP calls. Paths become local alias hashes. */
-  addCursorSelection(row: CursorAgentMetadata): void {
+  addCursorSelection(row: CursorAgentMetadata & { skillArtifacts?: string[] }): void {
     for (const call of row.mcpCalls ?? []) {
       if (!Number.isSafeInteger(call.completedAtMs) || call.completedAtMs < 0 || call.completedAtMs > 8.64e15) throw new Error("Invalid Cursor MCP timestamp.");
       const date = new Date(call.completedAtMs).toISOString().slice(0, 10);
@@ -758,7 +758,8 @@ export class CapabilityCollector {
     if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > 8.64e15) throw new Error("Invalid Cursor selection timestamp.");
     const date = new Date(timestamp).toISOString().slice(0, 10);
     if (date < this.options.since || date > this.options.until) return;
-    const artifacts = new Set<string>();
+    const artifacts = new Set<string>(row.skillArtifacts ?? []);
+    if ([...artifacts].some(value => !/^[a-f0-9]{64}$/.test(value))) throw new Error("Invalid Cursor selected artifact identity.");
     for (const path of row.skillPaths) {
       if (!isAbsolute(path) || !/(?:^|[/\\])SKILL\.md$/.test(path)) continue;
       try { artifacts.add(cursorArtifact(realpathSync(dirname(path)))); }
