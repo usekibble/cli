@@ -6,6 +6,9 @@ import { ClaudeTokenReader } from "./claude.js";
 import { copilotUsageVisitor, type CopilotUsageDelta } from "./copilot.js";
 import type { Rec, TranscriptVisitor } from "./transcripts.js";
 import type { VsCodeRequest } from "./vscode.js";
+import type { CursorSample } from "./cursor.js";
+import type { CursorToolSample } from "./cursor-tools.js";
+import type { CursorActivitySample } from "./cursor-activity.js";
 
 /**
  * The sidecar: what each repo cost, and what the agent did there.
@@ -165,6 +168,14 @@ export const ACTIVITY_KEYS = [
   "hookRuns",
   "hookErrors",
 ] as const satisfies readonly (keyof RepoActivity)[];
+
+/** Cursor hooks do not establish these response, edit or attribution counters. */
+const CURSOR_UNAVAILABLE: readonly RepoMetricKey[] = [
+  "messageCount", "thinkingBlocks", "textBlocks", "turnMessages", "turnMessagesMax",
+  "iterations", "sidechainMessages", "tokensReasoning", "tokensCacheWrite1h", "tokensCacheWrite5m",
+  "webSearchRequests", "webFetchRequests", "edits", "hunks", "linesAdded", "linesRemoved",
+  "userModified", "sandboxDisabled", "apiErrors", "compactions", "hookRuns", "hookErrors",
+];
 
 export type RepoMetricKey = keyof RepoActivity | "tokensIn" | "tokensOut" | "tokensCacheRead" | "tokensCacheWrite" | "messageCount" | "costMicros";
 
@@ -367,6 +378,72 @@ export class RepoCollector {
       if (tool.sandboxBypass) a.sandboxDisabled++;
       a.facet("tool", tool.server ? `mcp__${tool.server}` : tool.name);
     }
+  }
+
+  addCursorTool(sample: CursorToolSample): void {
+    if (!this.inRange(sample.date) || !sample.repo) return;
+    const row = this.at(sample.date, "cursor", sample.repo, null);
+    row.sessionIds.add(sample.conversationId);
+    row.toolCalls += 1;
+    if (sample.failed) row.toolErrors += 1;
+    if (sample.durationMs !== null) {
+      row.toolTimed += 1;
+      row.toolDurationMs += sample.durationMs;
+    }
+    const tools = row.facets.get("tool") ?? new Map<string, number>();
+    tools.set(sample.toolName, (tools.get(sample.toolName) ?? 0) + 1);
+    row.facets.set("tool", tools);
+  }
+
+  private cursorStops = new Set<string>();
+
+  addCursorActivity(sample: CursorActivitySample): void {
+    if (!this.inRange(sample.date) || !sample.repo) return;
+    const row = this.at(sample.date, "cursor", sample.repo, null);
+    row.sessionIds.add(sample.conversationId);
+    row.facet("version", sample.cursorVersion);
+    if (sample.event === "subagentStop") row.sidechainMessages += sample.sidechainMessages ?? 0;
+    else if (sample.event === "beforeSubmitPrompt") row.humanTurns += 1;
+    else {
+      const key = JSON.stringify([sample.conversationId, sample.generationId]);
+      if (this.cursorStops.has(key)) return;
+      this.cursorStops.add(key);
+      row.turns += 1;
+      if (sample.durationMs != null) {
+        row.turnDurationMs += sample.durationMs;
+        row.turnDurationMsMax = Math.max(row.turnDurationMsMax, sample.durationMs);
+      }
+      if (sample.durationMs == null) {
+        row.unavailableMetrics.add("turnDurationMs");
+        row.unavailableMetrics.add("turnDurationMsMax");
+      }
+      if (sample.status === null) row.unavailableMetrics.add("interrupted");
+      if (sample.status === "aborted") row.interrupted += 1;
+    }
+  }
+
+  /** Already deduplicated stop samples from the daily source's same snapshot. */
+  addCursor(sample: CursorSample): void {
+    if (!this.inRange(sample.date) || !sample.repo) return;
+    const row = this.at(sample.date, "cursor", sample.repo, null);
+    row.sessionIds.add(sample.conversationId);
+    row.tokensIn += sample.tokensIn;
+    row.tokensOut += sample.tokensOut;
+    row.tokensCacheRead += sample.tokensCacheRead;
+    row.tokensCacheWrite += sample.tokensCacheWrite;
+    row.costMicros += this.priceOf(sample.model, {
+      input_tokens: sample.tokensIn, output_tokens: sample.tokensOut,
+      cache_read_input_tokens: sample.tokensCacheRead, cache_creation_input_tokens: sample.tokensCacheWrite,
+    });
+    const key = JSON.stringify([sample.conversationId, sample.generationId]);
+    if (!this.cursorStops.has(key)) {
+      this.cursorStops.add(key);
+      row.turns += 1;
+      row.unavailableMetrics.add("turnDurationMs");
+      row.unavailableMetrics.add("turnDurationMsMax");
+      row.unavailableMetrics.add("interrupted");
+    }
+    // A stop covers a turn, not a known number of model responses or tool calls.
   }
 
   /** Claude Code: cwd and gitBranch on every record. */
@@ -993,7 +1070,9 @@ export class RepoCollector {
           tokensCacheWrite: a.tokensCacheWrite,
           messageCount: a.messageCount,
           costMicros: a.costMicros,
-          ...(agent === "copilot" ? { unavailableMetrics: [...a.unavailableMetrics].sort() } : {}),
+          ...(agent === "copilot" || agent === "cursor" ? {
+            unavailableMetrics: [...new Set([...a.unavailableMetrics, ...(agent === "cursor" ? CURSOR_UNAVAILABLE : [])])].sort(),
+          } : {}),
           facets,
           ...Object.fromEntries(ACTIVITY_KEYS.map((k) => [k, a[k]])),
           sessions: a.sessionIds.size,

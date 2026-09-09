@@ -1,10 +1,284 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CapabilityCollector, codexInventory, inventory } from "../dist/sources/capabilities.js";
+import { CapabilityCollector, codexInventory, cursorInventory, inventory } from "../dist/sources/capabilities.js";
 import { RepoCollector } from "../dist/sources/repos.js";
 import { ModelActivityCollector } from "../dist/sources/model-activity.js";
+import { CursorSource, cursorUsagePath, normalizeCursorStop } from "../dist/sources/cursor.js";
+import { cursorToolsPath, normalizeCursorTool, readCursorTools } from "../dist/sources/cursor-tools.js";
+import { captureCursorInventory, readCursorInventory } from "../dist/sources/cursor-inventory.js";
+
+// Cursor replay, malformed records and cache interpretation must not change
+// spend. The source and sidecars must agree without reading hook content.
+{
+  const home = mkdtempSync(join(tmpdir(), 'kibble-cursor-usage-'));
+  try {
+    const path = cursorUsagePath(home), project = join(home, 'private-layout', 'cursor-fixture');
+    mkdirSync(join(project, '.git'), { recursive: true });
+    mkdirSync(join(home, '.config/kibble'), { recursive: true });
+    const observed = new Date('2026-09-05T23:59:59Z');
+    const options = { since: '2026-09-05', until: '2026-09-05' };
+    const raw = {
+      hook_event_name: 'stop', conversation_id: '6eb5549f-0000-4000-8000-000000000001',
+      generation_id: '0b1b8c24-0000-4000-8000-000000000001', model: 'claude-4-sonnet',
+      input_tokens: 23666, output_tokens: 5, cache_read_tokens: 23617, cache_write_tokens: 47,
+      cwd: project,
+    };
+    const privatePayload = { ...raw };
+    for (const key of ['prompt', 'text', 'tool_arguments', 'tool_input', 'transcript_path', 'timestamp', 'usage']) {
+      Object.defineProperty(privatePayload, key, { get() { throw new Error(`read private Cursor ${key}`); } });
+    }
+    const sample = normalizeCursorStop(privatePayload, observed);
+    assert.deepEqual([sample.tokensIn, sample.tokensOut, sample.tokensCacheRead, sample.tokensCacheWrite], [2, 5, 23617, 47]);
+    assert.equal(sample.date, '2026-09-05');
+    assert.equal(sample.repo, 'cursor-fixture');
+    assert(!JSON.stringify(sample).includes(home));
+    assert.equal(normalizeCursorStop({ ...raw, cwd: undefined, workspace_roots: [project] }, observed).repo, 'cursor-fixture');
+    assert.equal(normalizeCursorStop({ ...raw, cwd: undefined, workspace_roots: [project, join(home, 'other')] }, observed).repo, null);
+    assert.equal(normalizeCursorStop({ hook_event_name: 'stop', usage: { input_tokens: 12 } }, observed), null, 'unknown nested usage cannot become a measured zero');
+    assert.equal(normalizeCursorStop({ ...raw, hook_event_name: 'afterAgentResponse' }, observed), null);
+    for (const key of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens']) {
+      const partial = { ...raw };
+      delete partial[key];
+      assert.throws(() => normalizeCursorStop(partial, observed), /Invalid Cursor usage metadata/, `${key} cannot be silently omitted`);
+      for (const value of [-1, 0.5, 'PRIVATE_COUNTER_SENTINEL', null, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]) {
+        assert.throws(() => normalizeCursorStop({ ...raw, [key]: value }, observed), error => /Invalid Cursor usage metadata/.test(error.message) && !error.message.includes('SENTINEL'));
+      }
+    }
+    for (const invalid of [
+      { cache_read_tokens: 23666, cache_write_tokens: 1 },
+      { conversation_id: '/private/session' }, { generation_id: 'PRIVATE_CONTENT_SENTINEL' },
+      { model: 'PRIVATE MODEL CONTENT' }, { input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 1 },
+    ]) assert.throws(() => normalizeCursorStop({ ...raw, ...invalid }, observed), /Invalid Cursor usage metadata/);
+    assert.throws(() => normalizeCursorStop(raw, new Date(NaN)), /Invalid Cursor usage metadata/);
+
+    // Independently chosen micro-dollar rates: input 2, output 10, read 1,
+    // write 3. Captured counts therefore cost 4 + 50 + 23617 + 141 = 23812.
+    const pricing = { async prefetch() {}, costMicros(_model, u) { return u.input * 2 + u.output * 10 + u.cacheRead + u.cacheWrite * 3; } };
+    const priceOf = (_model, u) => u.input_tokens * 2 + u.output_tokens * 10 + u.cache_read_input_tokens + u.cache_creation_input_tokens * 3;
+    const persist = samples => writeFileSync(path, samples.map(s => JSON.stringify(s) + '\n').join(''));
+    persist([sample, sample, { ...sample, date: '2026-09-06' }]);
+    const source = new CursorSource({ home, pricing });
+    const daily = await source.collect(options);
+    const snapshot = source.snapshot(options);
+    assert.equal(snapshot.length, 1);
+    assert(Object.isFrozen(snapshot[0]));
+    assert.throws(() => { snapshot[0].tokensIn = 999; }, TypeError);
+    assert.deepEqual(source.snapshot({ since: '2026-09-06', until: '2026-09-06' }), [], 'a later receipt of the same generation must not add another day');
+    assert.equal(daily.daily[0].costMicros, 23812);
+    assert.equal(daily.daily[0].messageCount, 0);
+    assert.equal(daily.sessions.length, 1);
+    assert.match(daily.sessions[0].sessionId, /^cursor:[a-f0-9]{64}$/);
+    assert.notEqual(daily.sessions[0].sessionId, raw.conversation_id);
+    assert.equal(daily.sessions[0].messageCount, 0);
+    assert.equal(daily.sessions[0].costMicros, 23812);
+    const { scanLocal } = await import('../dist/sources/local.js');
+    const sidecars = scanLocal({ ...options, home, capabilities: false, cursorSamples: snapshot, priceOf });
+    assert.equal(sidecars.repos.length, 1);
+    assert.equal(sidecars.modelActivity.length, 1);
+    const repo = sidecars.repos[0], model = sidecars.modelActivity[0];
+    for (const row of [daily.daily[0], repo]) {
+      assert.deepEqual([row.tokensIn, row.tokensOut, row.tokensCacheRead, row.tokensCacheWrite], [2, 5, 23617, 47]);
+      assert.equal(row.costMicros, 23812);
+      assert.equal(row.messageCount, 0);
+    }
+    assert.equal(repo.turns, 1);
+    for (const metric of ["messageCount", "thinkingBlocks", "sidechainMessages", "turnDurationMs", "edits"]) {
+      assert(repo.unavailableMetrics.includes(metric), `${metric} must remain unknown when Cursor hooks cannot establish it`);
+    }
+    assert(!repo.unavailableMetrics.includes("tokensIn"), "recorded stop tokens remain observable");
+    assert.equal(repo.sessions, 1);
+    assert.equal(model.sessions, 1);
+    assert.equal(model.tokens, 23671);
+    assert.equal(model.costMicros, 23812);
+    assert.equal(model.messageCount, 0);
+    assert.equal(model.toolCalls, 0);
+    assert(!JSON.stringify({ daily, sidecars }).includes(home));
+
+    appendFileSync(path, JSON.stringify({ ...sample, generationId: '0b1b8c24-0000-4000-8000-000000000002' }) + '\n');
+    assert.equal(source.snapshot(options).length, 1, 'sidecar reads must retain the same collection snapshot after append');
+    assert.equal((await source.collect(options)).daily[0].costMicros, 23812);
+    assert.equal((await new CursorSource({ home, pricing }).collect(options)).daily[0].costMicros, 47624);
+    persist([sample, { ...sample, tokensOut: 6 }]);
+    await assert.rejects(new CursorSource({ home, pricing }).collect(options), /Conflicting Cursor generation metadata/);
+    for (const tail of [JSON.stringify(sample), '{"PRIVATE_CORRUPTION_SENTINEL":\n', JSON.stringify({ ...sample, prompt: 'PRIVATE_CONTENT_SENTINEL' }) + '\n', 'x'.repeat(4097) + '\n', Buffer.from([0xff, 0x0a])]) {
+      writeFileSync(path, Buffer.concat([Buffer.from(JSON.stringify(sample) + '\n'), Buffer.from(tail)]));
+      await assert.rejects(new CursorSource({ home, pricing }).collect(options), error => /Could not read complete Cursor usage metadata/.test(error.message) && !error.message.includes('PRIVATE_'));
+    }
+    const missing = await new CursorSource({ home, path: join(home, 'missing.jsonl'), pricing }).collect(options);
+    assert.deepEqual(missing, { daily: [], sessions: [] });
+    // Completed tools may arrive after midnight without another model response.
+    // They must preserve actual calls and timings without inventing spend.
+    persist([sample]);
+    const toolPath = cursorToolsPath(home);
+    const toolRaw = { ...raw, hook_event_name: 'postToolUse', tool_use_id: 'call_1', tool_name: 'Shell', duration: 250 };
+    for (const key of ['tool_input', 'tool_output', 'error_message', 'prompt', 'text', 'server_url', 'transcript_path']) {
+      Object.defineProperty(toolRaw, key, { get() { throw new Error(`read private tool field ${key}`); } });
+    }
+    const success = normalizeCursorTool(toolRaw, new Date('2026-09-06T00:00:01Z'));
+    const failure = normalizeCursorTool({ ...raw, hook_event_name: 'postToolUseFailure', tool_use_id: 'call_2', tool_name: 'MCP:PRIVATE_SERVER', duration: 5000 }, new Date('2026-09-06T00:00:02Z'));
+    const unknownModel = normalizeCursorTool({ ...raw, generation_id: '0b1b8c24-0000-4000-8000-000000000099', model: undefined, hook_event_name: 'postToolUse', tool_use_id: 'call_3', tool_name: 'mcp__PRIVATE_SERVER__tool' }, new Date('2026-09-06T00:00:03Z'));
+    assert.equal(success.failed, false);
+    assert.equal(failure.failed, true);
+    assert.equal(failure.toolName, 'MCP');
+    assert.equal(unknownModel.toolName, 'MCP');
+    assert.equal(unknownModel.durationMs, null);
+    assert.equal(unknownModel.model, null);
+    assert.equal(normalizeCursorTool(raw, observed), null);
+    for (const duration of [-1, 'PRIVATE_DURATION', Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => normalizeCursorTool({ ...raw, hook_event_name: 'postToolUse', tool_use_id: 'call', tool_name: 'Shell', duration }, observed), /Invalid Cursor tool metadata/);
+    }
+    for (const bad of [{ tool_use_id: '/private/path' }, { tool_name: '/private/path' }, { conversation_id: 'private prompt' }, { generation_id: undefined }]) {
+      assert.throws(() => normalizeCursorTool({ ...raw, hook_event_name: 'postToolUse', tool_use_id: 'call', tool_name: 'Shell', ...bad }, observed), /Invalid Cursor tool metadata/);
+    }
+    const writeTools = rows => writeFileSync(toolPath, rows.map(r => JSON.stringify(r) + '\n').join(''));
+    writeTools([success, success, { ...success, date: '2026-09-07' }, failure, unknownModel]);
+    assert.equal(readCursorTools(toolPath).length, 3);
+    const tomorrow = { since: '2026-09-06', until: '2026-09-06' };
+    const toolSource = new CursorSource({ home, pricing });
+    const toolDaily = await toolSource.collect(tomorrow);
+    const tools = toolSource.toolSnapshot(tomorrow);
+    assert.equal(tools.length, 3);
+    assert(Object.isFrozen(tools[0]));
+    assert.throws(() => { tools[0].failed = true; }, TypeError);
+    assert.deepEqual(toolSource.toolSnapshot({ since: '2026-09-07', until: '2026-09-07' }), []);
+    assert.deepEqual(toolDaily.daily, [], 'tool-only activity cannot create billed tokens');
+    assert.equal(toolDaily.sessions.length, 1);
+    assert.equal(toolDaily.sessions[0].sessionId, daily.sessions[0].sessionId);
+    assert.equal(toolDaily.sessions[0].date, '2026-09-06');
+    assert.equal(toolDaily.sessions[0].costMicros, 0);
+    assert.equal(toolDaily.sessions[0].messageCount, 0);
+    const toolSidecars = scanLocal({ ...tomorrow, home, capabilities: false, cursorSamples: toolSource.snapshot(tomorrow), cursorTools: tools, priceOf });
+    assert.deepEqual(toolSidecars.capabilities, []);
+    const toolRepo = toolSidecars.repos[0], toolModel = toolSidecars.modelActivity[0];
+    assert.equal(toolRepo.toolCalls, 3);
+    assert.equal(toolRepo.toolErrors, 1);
+    assert(!toolRepo.unavailableMetrics.includes("toolErrors"), "explicit failed tool hooks remain observable");
+    assert.equal(toolRepo.toolTimed, 2);
+    assert.equal(toolRepo.toolDurationMs, 5250);
+    assert.equal(toolRepo.messageCount, 0);
+    assert.equal(toolRepo.turns, 0);
+    assert.equal(toolRepo.costMicros, 0);
+    assert.equal(toolRepo.sessions, 1);
+    assert.deepEqual(toolRepo.facets.filter(r => r.facet === 'tool').map(r => [r.value, r.count]).sort(), [['MCP', 2], ['Shell', 1]]);
+    assert.equal(toolSidecars.modelActivity.length, 1, 'a missing tool model must not inherit the previous model');
+    assert.equal(toolModel.toolCalls, 2);
+    assert.equal(toolModel.sessions, 1);
+    assert.equal(toolModel.tokens, 0);
+    assert.equal(toolModel.messageCount, 0);
+    assert(!JSON.stringify({ tools, toolSidecars }).includes('PRIVATE_'));
+    assert(!JSON.stringify({ tools, toolSidecars }).includes(home));
+    appendFileSync(toolPath, JSON.stringify({ ...success, toolId: 'call_4' }) + '\n');
+    assert.equal(toolSource.toolSnapshot(tomorrow).length, 3);
+    assert.equal(new CursorSource({ home, pricing }).toolSnapshot(tomorrow).length, 4);
+    writeTools([success, { ...success, failed: true }]);
+    assert.throws(() => new CursorSource({ home, pricing }).toolSnapshot(tomorrow), /Conflicting Cursor tool metadata/);
+    for (const corrupt of [JSON.stringify(success), '{"PRIVATE_TOOL_CORRUPTION":\n', JSON.stringify({ ...success, tool_input: 'PRIVATE_CONTENT' }) + '\n', Buffer.from([0xff, 0x0a])]) {
+      writeFileSync(toolPath, Buffer.concat([Buffer.from(JSON.stringify(success) + '\n'), Buffer.from(corrupt)]));
+      await assert.rejects(new CursorSource({ home, pricing }).collect(options), error => /Could not read complete Cursor tool metadata/.test(error.message) && !error.message.includes('PRIVATE_'));
+    }
+    console.log('OK  Cursor stop cache counts, private metadata, replay, snapshot consistency and corrupt-store failures preserve spend across daily and sidecar cuts');
+    console.log('OK  Cursor tool completion, failure, midnight activity and durations survive replay without leaking arguments or MCP identities');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// Inventory collection must not leak skill content, duplicate symlinked skills,
+// fabricate invocations, or run when the organization's policy disables it.
+{
+  const home = mkdtempSync(join(tmpdir(), 'kibble-cursor-inventory-'));
+  try {
+    const skill = join(home, '.cursor/skills/category/audit');
+    mkdirSync(skill, { recursive: true });
+    writeFileSync(join(skill, 'SKILL.md'), '---\nname: audit\ndescription: Review changes\n---\nPRIVATE_BODY_SENTINEL');
+    mkdirSync(join(home, '.agents/skills'), { recursive: true });
+    symlinkSync(skill, join(home, '.agents/skills/alias'), 'junction');
+    symlinkSync(join(home, '.cursor/skills'), join(home, '.cursor/skills/category/cycle'), 'junction');
+    mkdirSync(join(home, '.cursor/commands'), { recursive: true });
+    writeFileSync(join(home, '.cursor/commands/ship.md'), 'PRIVATE_COMMAND_SENTINEL');
+    const builtin = join(home, '.cursor/skills-cursor/builtin-audit');
+    mkdirSync(builtin, { recursive: true });
+    writeFileSync(join(builtin, 'SKILL.md'), '---\ndescription: Built-in review\n---\nPRIVATE_BUILTIN_SENTINEL');
+    assert.equal(cursorInventory(home).skills.get('audit')?.descriptionTokens > 0, true);
+    const { scanLocal } = await import('../dist/sources/local.js');
+    const options = { home, since: '2026-09-05', until: '2026-09-05', repos: false, cursorActiveDates: ['2026-09-04', '2026-09-05', '2026-09-05'] };
+    const rows = scanLocal(options).capabilities;
+    assert.deepEqual(rows.map(r => [r.agent, r.kind, r.name, r.invocations]).sort(), [['cursor', 'command', 'ship', 0], ['cursor', 'skill', 'audit', 0], ['cursor', 'skill', 'builtin-audit', 0]]);
+    assert(rows.every(r => r.date === '2026-09-05' && r.installed && r.attributedTokens === 0 && r.attributedCostMicros === 0));
+    assert(!JSON.stringify(rows).includes('PRIVATE_'));
+    assert(!JSON.stringify(rows).includes(home));
+    assert(rows.every(row => row.unavailableMetrics.includes("attributedCostMicros")), "Cursor inventory must not establish zero attributed spend");
+    assert(rows.filter(row => row.kind === "skill").every(row => row.unavailableMetrics.includes("invocations")), "no typed selection cannot prove a skill unused");
+    assert.deepEqual(scanLocal(options).capabilities, rows);
+    assert.deepEqual(scanLocal({ ...options, cursorActiveDates: [] }).capabilities, []);
+    assert.deepEqual(scanLocal({ ...options, capabilities: false }).capabilities, []);
+    console.log('OK  Cursor inventory respects policy and activity dates without leaking content or inventing invocation counts');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// Project inventory must not cross checkout boundaries, leak local metadata,
+// or duplicate a skill reached through both captured and personal aliases.
+{
+  const home = mkdtempSync(join(tmpdir(), 'kibble-cursor-project-inventory-'));
+  try {
+    const project = join(home, 'PRIVATE_LAYOUT_SENTINEL', 'checkout');
+    const cwd = join(project, 'packages', 'nested');
+    const putSkill = (root, name, description = 'Project inventory') => {
+      const path = join(root, '.cursor', 'skills', name);
+      mkdirSync(path, { recursive: true });
+      writeFileSync(join(path, 'SKILL.md'), `---\ndescription: ${description}\n---\nPRIVATE_BODY_SENTINEL`);
+      return path;
+    };
+    mkdirSync(join(project, '.git'), { recursive: true });
+    mkdirSync(cwd, { recursive: true });
+    putSkill(join(home, 'PRIVATE_LAYOUT_SENTINEL'), 'outside-checkout');
+    putSkill(home, 'audit', 'Personal');
+    putSkill(project, 'audit', 'Ancestor');
+    const nearest = putSkill(cwd, 'categories/audit', 'Nearest project wins over ancestor and personal');
+    const shared = putSkill(project, 'categories/shared');
+    symlinkSync(shared, join(home, '.cursor/skills/personal-alias'), 'junction');
+    mkdirSync(join(project, '.cursor/commands'), { recursive: true });
+    writeFileSync(join(project, '.cursor/commands/deploy.md'), 'PRIVATE_COMMAND_SENTINEL');
+    const captured = cursorInventory(home, [cwd]);
+    assert.equal(captured.skills.has('outside-checkout'), false, 'project discovery stops at the checkout boundary');
+    assert.equal(captured.skills.get('audit').realPath, realpathSync(nearest), 'the nearest project overrides ancestor and personal definitions');
+    assert.equal(captured.skills.get('shared').source, 'project');
+    assert.equal(captured.commands.get('deploy').source, 'project');
+    const observed = new Date('2026-09-05T12:00:00Z');
+    captureCursorInventory(captured, [cwd], observed, home);
+    const stored = readCursorInventory(home, '2026-09-05', '2026-09-05');
+    assert.deepEqual(stored.map(entry => `${entry.kind}:${entry.name}`).sort(), ['command:deploy', 'skill:audit', 'skill:shared']);
+    const directory = join(home, '.config/kibble/cursor-inventory');
+    const files = readdirSync(directory);
+    assert.equal(files.length, 1);
+    assert.match(files[0], /^[a-f0-9]{64}\.json$/);
+    const persisted = readFileSync(join(directory, files[0]), 'utf8');
+    assert(!persisted.includes('PRIVATE_'));
+    assert(!persisted.includes(home));
+    const { scanLocal } = await import('../dist/sources/local.js');
+    const options = { home, since: '2026-09-05', until: '2026-09-05', repos: false };
+    const rows = scanLocal(options).capabilities;
+    assert.deepEqual(rows.map(entry => `${entry.kind}:${entry.name}`).sort(), ['command:deploy', 'skill:audit', 'skill:shared']);
+    assert.equal(rows.find(entry => entry.name === 'audit').descriptionTokens, captured.skills.get('audit').descriptionTokens);
+    assert(!JSON.stringify(rows).includes('PRIVATE_'));
+    assert(!JSON.stringify(rows).includes(home));
+    assert(rows.every(entry => !Object.hasOwn(entry, 'artifact') && !Object.hasOwn(entry, 'realPath')));
+    captureCursorInventory(captured, [cwd], observed, home);
+    assert.equal(readdirSync(directory).length, 1);
+    assert.deepEqual(scanLocal(options).capabilities, rows, 'replaying a snapshot does not duplicate capability rows');
+    assert.deepEqual(readCursorInventory(home, '2026-09-06', '2026-09-06'), []);
+    assert.deepEqual(scanLocal({ ...options, since: '2026-09-06', until: '2026-09-06' }).capabilities, [], 'out-of-window captures cannot establish activity');
+    rmSync(join(project, '.cursor'), { recursive: true, force: true });
+    rmSync(join(cwd, '.cursor'), { recursive: true, force: true });
+    captureCursorInventory(cursorInventory(home, [cwd]), [cwd], observed, home);
+    assert.deepEqual(readCursorInventory(home, options.since, options.until), [], 'empty replacement removes previously observed project entries');
+    assert.deepEqual(scanLocal(options).capabilities, []);
+    writeFileSync(join(directory, files[0]), '{"PRIVATE_CORRUPT_SENTINEL":');
+    assert.throws(() => scanLocal(options), /Invalid or unreadable Cursor project inventory/);
+    assert.deepEqual(scanLocal({ ...options, capabilities: false }).capabilities, [], 'disabled capability collection never reads a corrupt inventory');
+    console.log('OK  Cursor project snapshots preserve scope, precedence, privacy and alias deduplication');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
 
 // Money and collector accuracy: known transcript counts, model switches,
 // repeated rate-limit snapshots, and a session resumed across the window.

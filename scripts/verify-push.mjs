@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { register } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ const stubs = {
   [`${dist}sources/local.js`]: "export const scanLocal = (options) => ({ repos: [], capabilities: options.capabilities ? globalThis.__kibblePushFixture.capabilities : [], modelActivity: [] });",
   [`${dist}sources/plans.js`]: "export const readPlans = () => []; export const describePlans = () => [];",
   [`${dist}commands/schedule.js`]: "export const enforcePolicy = (...args) => globalThis.__kibblePushFixture.policies.push(args);",
+  [`${dist}commands/cursor.js`]: "export const ensureCursorHooks = () => globalThis.__kibblePushFixture.ensureCursorHooks();",
 };
 const loader = `
   const stubs = new Map(Object.entries(${JSON.stringify(stubs)}));
@@ -49,6 +50,12 @@ const fixture = globalThis.__kibblePushFixture = {
   collects: 0,
   emptyDaily: false,
   capabilities: [],
+  hookCalls: 0,
+  hookFail: false,
+  ensureCursorHooks() {
+    this.hookCalls++;
+    if (this.hookFail) throw new Error("fixture hook setup failure");
+  },
   collect(range) {
     this.collects += 1;
     this.ranges.push(range);
@@ -173,6 +180,29 @@ try {
   fixture.emptyDaily = false;
   fixture.capabilities = [];
 
+  // Hook repair enables future collection even when no prior usage exists.
+  fixture.emptyDaily = true;
+  saveConfig(linked({ autoCollect: true }));
+  const beforeHooks = fixture.hookCalls;
+  assert.equal(await push({ quiet: true }), "empty");
+  assert.equal(fixture.hookCalls, beforeHooks + 1, "empty automatic pushes still repair Cursor hooks");
+  await push({ dryRun: true, quiet: true });
+  assert.equal(fixture.hookCalls, beforeHooks + 1, "dry runs cannot install or repair hooks");
+  saveConfig(linked({ autoCollect: false }));
+  await push({ quiet: true });
+  assert.equal(fixture.hookCalls, beforeHooks + 1, "manual-policy pushes do not modify hooks");
+  saveConfig(linked({ autoCollect: true }));
+  fixture.hookFail = true;
+  const beforeHookFailure = fixture.collects;
+  const requestsBeforeHookFailure = requests.length;
+  await assert.rejects(push({ quiet: true }), /fixture hook setup failure/);
+  assert.equal(fixture.collects, beforeHookFailure, "hook failures stop collection before an incomplete upload");
+  assert.equal(requests.length, requestsBeforeHookFailure);
+  assert.equal(loadConfig().lastPushedThrough, "2026-09-01", "hook failure cannot advance synchronization");
+  fixture.hookFail = false;
+  assert.equal(await push({ quiet: true }), "empty", "a failed hook repair releases the push lock for retry");
+  fixture.emptyDaily = false;
+
   // Credentials never leave their configured origin, and invalid ranges never
   // reach the collector or the network.
   saveConfig(linked());
@@ -187,6 +217,49 @@ try {
   await assert.rejects(push({ since: "2026-02-31", until: "2026-09-01" }), /valid UTC dates/);
   assert.equal(requests.length, requestsBeforeRefusals);
   assert.equal(fixture.collects, collectsBeforeRefusals);
+
+  // Account totals must remain separate from device rows, require opt-in, and
+  // survive an empty device collection. Unexpected local fields cannot leak.
+  const { validateCursorAccount, cursorExportDates } = await import(`${dist}sources/cursor-account.js`);
+  const account = {
+    accountId: "a".repeat(64), since: "2026-09-02", until: "2026-09-03",
+    fetchedAt: "2026-09-04T00:00:00Z", coveredDates: ["2026-09-02", "2026-09-03"],
+    sessionToken: "secret-must-stay-local",
+    rows: ["2026-09-02", "2026-09-03"].map(date => ({
+      date, agent: "cursor", model: "auto", provider: null,
+      tokensIn: 11, tokensOut: 2, tokensCacheRead: 3, tokensCacheWrite: 4,
+      tokensReasoning: 0, messageCount: 1, costMicros: 123,
+      rawAccountId: "private-account",
+    })),
+  };
+  writeFileSync(join(root, "kibble", "cursor-account.json"), JSON.stringify(account));
+  fixture.emptyDaily = true;
+  saveConfig(linked({ lastPushedThrough: "2026-09-05" }));
+  const beforeAccount = requests.length;
+  assert.equal(await push({ quiet: true }), "empty");
+  assert.equal(requests.length, beforeAccount, "account snapshot cannot activate without explicit opt-in");
+  saveConfig(linked({ lastPushedThrough: "2026-09-05", cursorAccountUsage: true }));
+  await push({ quiet: true });
+  const accountBody = JSON.parse(requests.at(-1).init.body);
+  assert.deepEqual(accountBody.rows, []);
+  assert.deepEqual(accountBody.cursorAccount.coveredDates, ["2026-09-02", "2026-09-03"], "account history is independent of local push cursor");
+  assert.equal(accountBody.cursorAccount.rows[0].costMicros, 123);
+  assert.ok(!requests.at(-1).init.body.includes("secret-must-stay-local"));
+  assert.ok(!requests.at(-1).init.body.includes("private-account"));
+  const beforeDry = requests.length;
+  await push({ dryRun: true, quiet: true });
+  assert.equal(requests.length, beforeDry, "account dry run does not upload");
+  assert.throws(() => validateCursorAccount({ ...account, fetchedAt: "2026-09-03T12:00:00Z" }), /Invalid Cursor/);
+  assert.throws(() => validateCursorAccount({ ...account, rows: [account.rows[0], { ...account.rows[0], provider: "other" }] }), /Invalid Cursor/);
+  assert.throws(() => validateCursorAccount({ ...account, rows: [{ ...account.rows[0], tokensIn: Number.MAX_SAFE_INTEGER + 1 }] }), /Invalid Cursor/);
+  assert.deepEqual(cursorExportDates('Date,Model\n"2026-09-01T23:59:59Z",a\n"2026-09-03T01:00:00Z",a\n'), ["2026-09-03"], "exclude oldest billing-boundary day and never infer absent zero days");
+  assert.deepEqual(cursorExportDates('Date,Model\n"2026-09-01T01:00:00Z",a\n'), []);
+  assert.throws(() => cursorExportDates('Date,Model\nnot-a-date,a\n'), /export date/);
+  writeFileSync(join(root, "kibble", "cursor-account.json"), "{secret-malformed");
+  saveConfig(linked({ cursorAccountUsage: true }));
+  await assert.rejects(push({ quiet: true }), /Could not read Cursor account snapshot/);
+  assert.equal(requests.length, beforeDry, "unreadable account snapshot fails without advancing or uploading");
+  fixture.emptyDaily = false;
 } finally {
   globalThis.fetch = originalFetch;
   globalThis.Date = originalDate;

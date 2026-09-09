@@ -9,6 +9,8 @@ import { ciUpload } from "./commands/ci.js";
 import { ciCollect } from "./commands/ci-collect.js";
 import { scheduleInstall, scheduleStatus, scheduleUninstall } from "./commands/schedule.js";
 import { skillInstall, skillShow, skillUninstall } from "./commands/skill.js";
+import { cursorInstall, cursorRecord, cursorStatus, cursorUninstall } from "./commands/cursor.js";
+import { cursorAccountSync, cursorAccountDisable } from "./sources/cursor-account.js";
 import { usage } from "./commands/usage.js";
 import { loadConfig, configPath } from "./config.js";
 import { devicePath } from "./device.js";
@@ -119,6 +121,14 @@ skill
   .command("show")
   .description("print the skill to stdout, for any other agent's skill directory")
   .action(skillShow);
+
+const cursor = program.command("cursor").description("Cursor account usage snapshots and experimental local activity hooks");
+cursor.command("install").description("add Kibble's usage and tool hooks while preserving other Cursor hooks").action(() => cursorInstall());
+cursor.command("uninstall").description("remove Kibble's hooks and retain collected counts").action(() => cursorUninstall());
+cursor.command("status").description("show hook registration and capture availability").action(cursorStatus);
+cursor.command("sync").description("download Cursor account totals through tokscale and enable snapshot uploads on future pushes").action(cursorAccountSync);
+cursor.command("account-disable").description("stop uploading Cursor account snapshots without deleting history or credentials").action(cursorAccountDisable);
+cursor.command("record", { hidden: true }).action(cursorRecord);
 
 const schedule = program
   .command("schedule")

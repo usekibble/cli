@@ -400,6 +400,123 @@ disposable GitHub runners because it creates and removes real OS jobs. The local
 collector against your raw Claude transcripts. An empty transcript window fails;
 CI passing does not substitute for that accuracy check after parser changes.
 
+## Cursor coverage
+
+Cursor support is experimental and incomplete. `kibble cursor install` registers
+personal submitted-prompt, `stop`, subagent completion, and completed/failed tool hooks while preserving existing
+hooks. `kibble cursor status` reports registration, validated turns/tool calls and the latest UTC day;
+`kibble cursor uninstall` removes only Kibble's hook and retains collected counts.
+These commands require a build containing this implementation.
+With automatic collection enabled, login installs the hooks before its first
+push when `~/.cursor` exists; subsequent pushes repair missing registrations,
+including when no usage is found. Dry runs and manual-policy pushes do not
+change hooks. Manual-policy users can run `kibble cursor install` explicitly.
+
+On Cursor versions that emit the supported token fields, the hook records future
+turns in the Kibble configuration directory as `cursor-usage.jsonl`. It discards
+text, credentials and paths, retaining only token buckets, model, opaque IDs and
+an optional repository name. `kibble push` reads one immutable snapshot for daily
+usage, real session IDs, repository spend and model spend. Cache reads and writes
+are subtracted from Cursor's inclusive input total before pricing. Repeated
+generations count once; conflicting metadata or a corrupt store abort collection.
+Stop events establish turns, not response counts. Prices use available catalog
+rates without guessing model-version aliases; unknown prices remain zero.
+
+Documented `postToolUse` and `postToolUseFailure` callbacks provide tool counts,
+failures and recorded durations, persisted separately in `cursor-tools.jsonl`.
+Fractional durations are rounded to integer milliseconds. Missing tool models can
+inherit an exact conversation/generation stop model; explicit model differences
+are preserved, never treated as guessed aliases. Opaque tool IDs deduplicate
+repeated callbacks. Cursor's bounded newline-separated compound call IDs are
+hashed without stripping components; legacy single IDs remain unchanged. Child
+completion IDs use the same normalization. MCP tool names become generic
+`MCP`; this tool-activity path does not expose server names when capability
+reporting is disabled. Tool arguments, output and error text are never retained.
+
+The token fields are evidenced in a captured Cursor CLI 2026.06.24 stop event
+and one live Cursor editor 3.19.13 turn on macOS, not a stable public contract.
+Multi-turn accuracy, subagent completeness, CLI and headless compatibility still
+require live validation. See the [capture and field semantics](https://github.com/omnigent-ai/omnigent/blob/main/docs/cursor-native-cost-tracking.md).
+Submitted-prompt and stop receipts additionally capture prompt submissions,
+completion status and version. Matching generation IDs establish elapsed turn
+time, not model compute time. Missing starts and backwards clocks remain
+unmeasured; prompt text and attachments are not inspected. These counters use
+the same frozen collection snapshot and do not add token usage or responses.
+Subagent completion records use the stable child tool-call ID to deduplicate
+reported child-message totals. Child duration stays local; child token and tool
+totals are not added to potentially overlapping parent totals.
+Cursor's account-wide tokscale CSV caches are excluded from device-local rows.
+The separate account import uses tokscale for token and cost totals, while local
+readers supply tools, skills, MCP and subagent activity. Account totals are not
+allocated to repositories, sessions or capabilities.
+
+`kibble cursor sync` explicitly authenticates through the pinned tokscale
+integration and saves a private, normalized account snapshot for subsequent
+pushes. Repeat it to refresh account usage; ordinary pushes do not authenticate
+or download account history. Deploy the matching server migration and ingest
+support before enabling this command on connected machines.
+Use `kibble cursor account-disable` to stop snapshot uploads while retaining
+the local snapshot, tokscale credentials and already uploaded history.
+
+Only completed UTC export days are authoritative; today's hooks remain local
+estimates so a midday snapshot cannot hide later activity. The oldest observed day is
+excluded because it can straddle a billing-period boundary. Days absent from the
+export remain unknown, not zero. Historical availability is limited to the
+export, not the complete account lifetime. Export event counts are not verified
+model-response counts, and reported usage cost is not an invoice charge.
+
+The account snapshot sends a SHA-256 account key, fetch timestamp, covered dates
+and normalized daily counts, never credentials or the raw account ID. The server
+binds one account per member and prevents sharing that account across members of
+one organization. Multiple laptops replace the same account totals instead of
+adding them. Newer snapshots replace covered days, including model removals;
+older snapshots cannot overwrite newer data. Account-covered days supersede all
+local Cursor model aliases. Uncovered days retain local estimates. Existing
+historical cache imports outside those covered dates still need reconciliation.
+
+When Cursor usage is present, capability collection reports personal skills
+from `~/.cursor/skills`, `~/.agents/skills` and the documented Claude and Codex
+compatibility directories, built-ins in `~/.cursor/skills-cursor`, plus commands
+in `~/.cursor/commands`. Installed presence does not establish enabled state. Nested skill
+categories and symlinks are supported. Zero invocations means unobserved, not
+unused. Stop hooks also snapshot skills and commands from the reported working
+directory and its ancestors through the checkout root. These use the same
+compatibility directories, with project names taking precedence over personal
+names. Snapshots retain names, description sizes and local alias hashes, never
+working-directory paths or bodies. They describe the last observed inventory;
+changes since that hook, untouched project subdirectories and plugin inventory
+remain unobserved. Snapshots outside the collection window are excluded.
+Explicit command and manually selected skill metadata is read from Cursor's
+local database in a read-only snapshot. Selections count once per message and
+name, using recorded timestamps. Skill paths are resolved to inventory names
+locally and never uploaded. Expanded commands and content are not decoded.
+This path has synthetic coverage; a live selected-skill control is still pending.
+Completed MCP calls in stored root and child turns supply stable call IDs and server
+display names. These count as capability invocations, not additional tool calls
+or spend. Pending calls do not count. Shared immutable steps count once across
+forked history. Child context does not establish fresh human skill/command
+selections. Standalone, inline and referenced child histories share replay and
+size limits; missing blobs, cycles or conflicting states abort collection.
+Embedded-child live controls and archived MCP coverage remain unverified.
+Arguments, results and scoped server identifiers are skipped.
+Automatic skill invocation, edits and plan detection remain
+unsupported. The organization capability policy applies to inventory and
+selection collection. `kibble skill install` also installs
+the usage-analysis skill under `~/.cursor/skills` when `~/.cursor` exists.
+
+The server accepts Cursor rows using the same strict, scoped contract as Claude
+Code and Codex. Synthetic checks cover count arithmetic, privacy, replay,
+snapshot consistency, hook configuration preservation and corrupt-store failure.
+Those checks do not substitute for a live Cursor accuracy comparison.
+Repository and capability rows mark unsupported counters with `unavailableMetrics`.
+Automatic skill use, capability context and attributed spend, response counts,
+edits and compactions remain unknown. A stop without a matching start also keeps
+elapsed duration unknown. Recorded token buckets and failed tool callbacks stay
+available; an unmeasured field is never evidence of zero use.
+The full remaining parity checklist is in `docs/cursor-parity.md` in the monorepo.
+Cursor's own hook debug logs can retain full incoming payloads independently of
+Kibble's metadata-only files; Kibble does not upload those logs.
+
 ## Claude Code and Codex metric coverage
 
 Both paths report the same wire fields when their logs expose the evidence.
@@ -501,6 +618,10 @@ the skills, slash commands and MCP servers installed here with recorded invocati
 automatic skill use and commands omitted from history are outside coverage. Per agent, how this machine is billed: a subscription and its tier
 (Max 5x, ChatGPT Pro), an API key, or a cloud provider's account. Never
 prompts, file contents, tool arguments.
+
+If you explicitly enable Cursor account sync, pushes also carry an opaque
+SHA-256 account key, snapshot timestamp and covered UTC dates with account-level
+daily totals. Cursor credentials and the raw account ID stay on this machine.
 
 The billing mode is read from the login state each agent already keeps
 (`~/.claude.json`, `~/.codex/auth.json`, and Copilot's config). Those files can

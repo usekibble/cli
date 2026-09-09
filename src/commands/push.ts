@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 import { loadConfig, saveConfig, type KibbleConfig } from "../config.js";
 import { acquire } from "../lock.js";
 import { enforcePolicy } from "./schedule.js";
+import { ensureCursorHooks } from "./cursor.js";
 import type { CapabilityRecord } from "../sources/capabilities.js";
 import { priceRecord, PricingContext } from "../sources/pricing.js";
 import { scanLocal } from "../sources/local.js";
+import { CursorSource } from "../sources/cursor.js";
+import { readCursorAccount } from "../sources/cursor-account.js";
 import { describePlans, readPlans } from "../sources/plans.js";
 import { summarizeRepos } from "../sources/repos.js";
 import { createSource } from "../sources/index.js";
@@ -150,10 +153,13 @@ export async function push(opts: {
   }
 
   async function run(): Promise<PushResult> {
+    if (!opts.dryRun && config.autoCollect) ensureCursorHooks(say);
     const pricing = new PricingContext();
-    const source = createSource({ pricing });
+    const cursor = new CursorSource({ pricing });
+    const source = createSource({ pricing, cursor });
     const result = await source.collect({ since, until });
     const rows = result.daily;
+    const cursorAccount = config.cursorAccountUsage ? readCursorAccount({ since: opts.since ?? utcDay(-29), until }) : undefined;
 
     // The organization's policy, echoed at login and on every push; on until a
     // server says otherwise. Names only -- see sources/capabilities.ts.
@@ -165,8 +171,12 @@ export async function push(opts: {
       until,
       priceOf,
       capabilities: wantCapabilities,
+      cursorActiveDates: rows.filter((row) => row.agent === "cursor").map((row) => row.date),
+      cursorSamples: cursor.snapshot({ since, until }),
+      cursorTools: cursor.toolSnapshot({ since, until }),
+      cursorActivity: cursor.activitySnapshot({ since, until }),
     });
-    if (rows.length === 0 && repos.length === 0 && capabilities.length === 0 && modelActivity.length === 0) {
+    if (!cursorAccount && rows.length === 0 && repos.length === 0 && capabilities.length === 0 && modelActivity.length === 0) {
       console.log(`${opts.quiet ? `${stamp()}  ` : ""}No usage found for ${since}..${until}.`);
       return "empty";
     }
@@ -175,7 +185,18 @@ export async function push(opts: {
     const days = new Set([...rows, ...repos, ...capabilities, ...modelActivity].map((r) => r.date)).size;
     say(`${since}..${until}  ${rows.length} rows across ${days} day(s)  [${source.name}]`);
     if (rows.length) say(summarize(rows).join("\n"));
+    if (rows.some(row => row.agent === "cursor") || capabilities.some(row => row.agent === "cursor")) {
+      say("  Cursor local coverage is partial: recorded selections and MCP usage may be available; automatic skill use and complete response history remain unmeasured. Account totals are separate.");
+    }
     say(`  ${"TOTAL".padEnd(14)} ${usd(total).padStart(10)}`);
+    if (cursorAccount) {
+      say(`\n  Cursor account snapshot: ${cursorAccount.coveredDates.length} completed days, fetched ${cursorAccount.fetchedAt}.`);
+      say(summarize(cursorAccount.rows).join("\n"));
+      say("  Account totals replace Cursor local totals on covered days; do not add these amounts together.");
+      if (Date.now() - Date.parse(cursorAccount.fetchedAt) > 86400000) {
+        say("  Cursor account snapshot is over 24 hours old. Run `kibble cursor sync` to refresh it.");
+      }
+    }
     const percentiles = sessionPercentiles(result);
     if (percentiles) say(`\n${percentiles}`);
     if (repos.length > 0) say(`\n${summarizeRepos(repos).join("\n")}`);
@@ -220,7 +241,9 @@ export async function push(opts: {
           "names with invocation counts and description sizes, and per agent\n" +
           "how this machine is billed (subscription, API key or cloud) and the\n" +
           "plan tier.\n" +
-          "No prompts, no file contents, no tool arguments, no paths, no ids.",
+          "Opted-in Cursor account snapshots add an opaque account key, covered dates,\n" +
+          "fetch time and account-wide token/cost totals. No credentials or raw account ids.\n" +
+          "No prompts, no file contents, no tool arguments, no paths.",
       );
       return "dry-run";
     }
@@ -240,6 +263,7 @@ export async function push(opts: {
       repos,
       modelActivity,
       plans,
+      ...(cursorAccount ? { cursorAccount } : {}),
     });
     const res = await postWithRetry(new URL("/api/ingest", server), config.linkToken, payload);
 

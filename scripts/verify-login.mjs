@@ -12,6 +12,7 @@ import { readUpdateState, writeUpdateState } from "../dist/update-state.js";
 const dist = new URL("../dist/", import.meta.url).href;
 const stubs = {
   [`${dist}commands/push.js`]: "export const push = () => globalThis.__loginFixture.push();",
+  [`${dist}commands/cursor.js`]: "export const ensureCursorHooks = () => globalThis.__loginFixture.ensureCursorHooks();",
   [`${dist}commands/schedule.js`]: "export const installed = () => false; export const preserveSchedule = () => {}; export const scheduleInstall = () => {}; export const removeSchedule = () => {}; export const enforcePolicy = () => globalThis.__loginFixture.scheduled.push(globalThis.__loginFixture.completed);",
 };
 register(`data:text/javascript,${encodeURIComponent(`
@@ -24,8 +25,16 @@ register(`data:text/javascript,${encodeURIComponent(`
 const { login } = await import("../dist/commands/login.js");
 const fixture = globalThis.__loginFixture = {
   calls: 0, completed: false, fail: false, result: "pushed", scheduled: [],
+  hookCalls: 0, hookFail: false,
+  ensureCursorHooks() {
+    this.hookCalls++;
+    assert.equal(this.scheduled.length, 0, "hook setup precedes the startup job");
+    assert.equal(loadConfig().linkToken, "new-link-credential", "hook setup follows successful linking");
+    if (this.hookFail) throw new Error("fixture hook setup failure");
+  },
   async push() {
     this.calls++;
+    assert.equal(this.hookCalls, this.calls, "hook setup precedes the first upload");
     assert.equal(this.scheduled.length, 0, "first upload starts before any startup job");
     assert.equal(loadConfig().linkToken, "new-link-credential");
     this.completed = true;
@@ -142,6 +151,7 @@ try {
   assert.equal(reporting.requestedScope, "usage.write usage.read.reporting");
 
   assert.equal(fixture.calls, 0, "policy-off login never collects");
+  assert.equal(fixture.hookCalls, 0, "policy-off login never installs hooks");
   const automatic = await verifyLogin("https://new.example", {
     renewed: false, email: "owner@example.test", organizationName: "Automatic fixture", autoCollect: true,
   });
@@ -171,6 +181,18 @@ try {
     assert.ok(lines.some(line => line.includes(result === "busy" ? "This login did not upload" : "no usage upload was confirmed")));
   }
   console.log = () => {};
+
+  fixture.scheduled = [];
+  fixture.completed = false;
+  fixture.hookFail = true;
+  const callsBeforeHookFailure = fixture.calls;
+  await assert.rejects(verifyLogin("https://new.example", {
+    renewed: true, email: "owner@example.test", organizationName: "Automatic fixture", autoCollect: true,
+  }), /Machine linked, but the first collection failed: fixture hook setup failure/);
+  assert.equal(fixture.calls, callsBeforeHookFailure, "failed hook setup stops the initial collection");
+  assert.equal(loadConfig().linkToken, "new-link-credential", "hook errors retain the successful link");
+  assert.equal(loadConfig().lastPushedThrough, undefined);
+  assert.deepEqual(fixture.scheduled, [false], "schedule retries even when hook setup fails before collection");
 
   let reads = 0;
   globalThis.fetch = async (input, init) => {

@@ -4,6 +4,7 @@ import { installId } from "../device.js";
 import { sameServerOrigin } from "../server.js";
 import { enforcePolicy, removeSchedule } from "./schedule.js";
 import { push } from "./push.js";
+import { ensureCursorHooks } from "./cursor.js";
 import { usageText } from "../usage-messages.js";
 import { offerAutomaticUpdates } from "../update-consent.js";
 
@@ -149,6 +150,7 @@ export async function login(opts: LoginOptions): Promise<void> {
   if (linked.autoCollect) {
     console.log("Collecting available usage from the last 30 UTC days now...");
     try {
+      ensureCursorHooks();
       const result = await push({});
       if (result === "busy") {
         console.log("This login did not upload usage because another push is running. Wait for it to finish, then run `kibble push` to confirm collection for this link.");

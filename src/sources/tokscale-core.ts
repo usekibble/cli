@@ -4,6 +4,7 @@ import {
 } from "@tokscale/core";
 import { PricingContext } from "./pricing.js";
 import { CodexSource } from "./codex-source.js";
+import { CursorSource } from "./cursor.js";
 import {
   normalizeAgent,
   type CollectOptions,
@@ -31,20 +32,22 @@ import {
  */
 
 export class TokscaleCoreSource implements UsageSource {
-  readonly name = "tokscale-core+codex";
+  readonly name = "tokscale-core+codex+cursor";
   readonly coverage =
-    "8 native clients plus Codex through Kibble's shared token decoder, with session ids";
+    "8 native clients, Codex transcripts and experimental Cursor stop hooks, with session ids";
 
   private readonly pricing: PricingContext;
   private readonly codex: CodexSource;
+  private readonly cursor: CursorSource;
 
   constructor(private readonly context: SourceContext = {}) {
     this.pricing = context.pricing ?? new PricingContext();
     this.codex = new CodexSource({ ...context, pricing: this.pricing });
+    this.cursor = context.cursor ?? new CursorSource({ ...context, pricing: this.pricing });
   }
 
   async version(): Promise<string> {
-    return `@tokscale/core native ${nativeVersion()}; ${await this.codex.version()}`;
+    return `@tokscale/core native ${nativeVersion()}; ${await this.codex.version()}; ${await this.cursor.version()}`;
   }
 
   async collect({ since, until }: CollectOptions): Promise<CollectResult> {
@@ -52,6 +55,7 @@ export class TokscaleCoreSource implements UsageSource {
       sources: ["claude", "opencode", "gemini", "amp", "droid", "openclaw", "pi", "kimi"],
     });
     const codex = await this.codex.collect({ since, until });
+    const cursor = await this.cursor.collect({ since, until });
 
     await this.pricing.prefetch(
       parsed.messages
@@ -123,10 +127,10 @@ export class TokscaleCoreSource implements UsageSource {
     }
 
     return {
-      daily: [...days.values(), ...codex.daily].sort(
+      daily: [...days.values(), ...codex.daily, ...cursor.daily].sort(
         (a, b) => a.date.localeCompare(b.date) || b.costMicros - a.costMicros,
       ),
-      sessions: [...sessions.values(), ...codex.sessions],
+      sessions: [...sessions.values(), ...codex.sessions, ...cursor.sessions],
     };
   }
 }

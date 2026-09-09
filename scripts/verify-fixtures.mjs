@@ -61,8 +61,8 @@ async function verifyHybridBoundary() {
   const fallback = fakeSource(
     "fallback-fixture",
     [
-      ...supported.map((agent, i) => sampleRow(agent, 900 + i)),
-      sampleRow("cursor", 500),
+      ...supported.filter(agent => agent !== "cursor").map((agent, i) => sampleRow(agent, 900 + i)),
+      sampleRow("zed", 500),
     ],
     [
       {
@@ -74,7 +74,7 @@ async function verifyHybridBoundary() {
       },
       {
         sessionId: "fallback-session",
-        agent: "cursor",
+        agent: "zed",
         date: "2026-08-21",
         messageCount: 1,
         costMicros: 500,
@@ -96,7 +96,7 @@ async function verifyHybridBoundary() {
     );
   }
   assert.equal(
-    result.daily.find((row) => row.agent === "cursor")?.costMicros,
+    result.daily.find((row) => row.agent === "zed")?.costMicros,
     500,
     "a fallback-only agent must remain in the hybrid",
   );
@@ -105,6 +105,11 @@ async function verifyHybridBoundary() {
     ["core-session", "fallback-session"],
     "sessions must follow the same no-overlap boundary",
   );
+  const accountCache = fakeSource("account-cache", [sampleRow("cursor", 900)], []);
+  const absent = await new TokscaleHybridSource(fakeSource("empty", [], []), accountCache).collect({ since: "2026-08-21", until: "2026-08-21" });
+  assert.equal(absent.daily.some(row => row.agent === "cursor"), false, "account-wide Cursor caches must never masquerade as this device's usage when hooks have no samples");
+  const overlapping = await new TokscaleHybridSource(core, accountCache).collect({ since: "2026-08-21", until: "2026-08-21" });
+  assert.deepEqual(overlapping.daily.filter(row => row.agent === "cursor"), (await core.collect()).daily.filter(row => row.agent === "cursor"), "account caches cannot duplicate or block the device-local lane; account precedence is applied separately by the server");
   console.log("OK  hybrid uses core-supported agents once and retains fallback-only agents");
 }
 

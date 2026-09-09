@@ -58,6 +58,8 @@ export interface KibbleConfig {
    * Owners and admins set it in the dashboard; nothing here can override it.
    */
   autoCollect?: boolean;
+  /** Explicit opt-in to uploading the locally synced Cursor account snapshot. */
+  cursorAccountUsage?: boolean;
 }
 
 const DEFAULT_CONFIG: KibbleConfig = { server: "https://app.usekibble.com" };
@@ -107,7 +109,7 @@ function validateConfig(value: unknown, path: string): KibbleConfig {
   ) {
     throw invalid(path, 'field "teamName" must be a string or null');
   }
-  for (const field of ["capabilities", "autoCollect", "reportingAccess"]) {
+  for (const field of ["capabilities", "autoCollect", "reportingAccess", "cursorAccountUsage"]) {
     if (config[field] !== undefined && typeof config[field] !== "boolean") {
       throw invalid(path, `field "${field}" must be a boolean`);
     }

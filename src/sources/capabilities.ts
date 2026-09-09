@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { copilotCapabilityName, readCopilotConfig } from "./copilot-config.js";
 import { vsCodeCapabilityInventory, vsCodeCapabilityInvocations } from "./vscode-capabilities.js";
@@ -11,6 +11,8 @@ import { codexItem, codexSettings } from "./codex.js";
 import { codexRoots } from "./codex-inventory.js";
 import { codexCommandName, codexSkillSelections } from "./codex-capabilities.js";
 import type { VsCodeRequest } from "./vscode.js";
+import { cursorArtifact, readCursorInventory } from "./cursor-inventory.js";
+import type { CursorAgentMetadata } from "./cursor-agent-metadata.js";
 
 /**
  * Capability telemetry: which skills, slash commands, and MCP servers a machine
@@ -50,6 +52,16 @@ import type { VsCodeRequest } from "./vscode.js";
  *   - Copilot skills from its documented personal, project and installed
  *     plugin roots, plus skill names, triggers, body lengths and MCP server
  *     names from structured Copilot session events.
+ *   - Cursor personal skill/command directories and last-observed project
+ *     inventory snapshots, including nested skills and compatibility roots.
+ *     Hooks derive snapshots from working-directory metadata, retaining names,
+ *     description sizes and local-only alias hashes, never paths or bodies.
+ *     Observation dates establish activity, never capability invocation counts.
+ *   - Cursor's local agent graph supplies explicit command names and manually
+ *     selected skill paths, resolved against inventory and discarded locally.
+ *     Message identities deduplicate selections; content bytes are not decoded.
+ *     Completed MCP steps supply a stable call ID and provider display name;
+ *     arguments, results and scoped server identifiers are not decoded.
  *
  * Bodies and descriptions are measured and discarded; only their sizes are kept.
  *
@@ -64,7 +76,7 @@ import type { VsCodeRequest } from "./vscode.js";
 export type CapabilityKind = "skill" | "command" | "mcp";
 
 /** Which agent the row is a fact about. Every capability row carries one. */
-export type CapabilityAgent = "claude-code" | "codex" | "copilot";
+export type CapabilityAgent = "claude-code" | "codex" | "copilot" | "cursor";
 
 export type CapabilityMetricKey = "invocations" | "triggerTyped" | "triggerModel" | "contextTokens" | "descriptionTokens" | "attributedTurns" | "attributedTokens" | "attributedCostMicros";
 
@@ -558,6 +570,62 @@ export function copilotInventory(
   return { skills, commands };
 }
 
+/** Cursor discovers nested skills, including its documented compatibility roots.
+ * Only directory names and description sizes are retained. A real-path walk
+ * prevents linked category directories from cycling or duplicating artifacts.
+ */
+export function cursorInventory(home = homedir(), cwds: Iterable<string> = []): Inventory {
+  const registry = artifactRegistry();
+  const visited = new Set<string>();
+  function skills(dir: string, source: CapabilitySource): void {
+    let real: string;
+    try { real = realpathSync(dir); }
+    catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new Error("could not inspect Cursor skill inventory");
+    }
+    if (visited.has(real)) return;
+    visited.add(real);
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith(".")) continue;
+      const path = join(dir, name);
+      let directory: boolean;
+      try { directory = statSync(path).isDirectory(); }
+      catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw new Error("could not inspect Cursor skill entry");
+      }
+      if (!directory) continue;
+      if (existsSync(join(path, "SKILL.md"))) registry.add("skill", name, path, source);
+      else skills(path, source);
+    }
+  }
+  const projects = new Set<string>();
+  for (const cwd of cwds) {
+    if (!isAbsolute(cwd)) continue;
+    let dir = cwd;
+    for (let depth = 0; depth < 32 && dir !== home; depth++) {
+      projects.add(dir);
+      if (existsSync(join(dir, ".git"))) break;
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  const roots: [string, CapabilitySource][] = [...projects].map(dir => [dir, "project"]);
+  roots.push([home, "personal"]);
+  for (const [dir, source] of roots) {
+    for (const root of [".cursor", ".agents", ".claude", ".codex"]) skills(join(dir, root, "skills"), source);
+    for (const entry of listEntries(join(dir, ".cursor", "commands"), "command")) {
+      registry.add("command", entry.name, entry.path, source);
+    }
+  }
+  // Cursor 3.19.13 installs its managed built-ins here. Presence establishes
+  // installed inventory only, not enabled state or a recorded invocation.
+  skills(join(home, ".cursor", "skills-cursor"), "personal");
+  return registry.inventory;
+}
+
 interface Bucket {
   invocations: number;
   triggerTyped: number;
@@ -607,6 +675,8 @@ export class CapabilityCollector {
     this.active("copilot", r.date);
     this.vscodeRequests.push(r);
   }
+  private readonly cursorSelections = new Map<string, { date: string; commands: string[]; artifacts: string[] }>();
+  private readonly cursorMcpCalls = new Map<string, { date: string; name: string; records: Set<string> }>();
   /** key: `${agent}|${date}|${kind}|${name}` */
   private readonly seen = new Map<string, Bucket>();
   /** Days each agent was active in the window; anchors that agent's idle rows. */
@@ -659,6 +729,54 @@ export class CapabilityCollector {
     if (!dates) this.activeDates.set(agent, (dates = new Set()));
     dates.add(date);
   };
+
+  /** Recorded usage establishes activity, but contains no capability invocations. */
+  addCursorActivity(date: string): void {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date) && date >= this.options.since && date <= this.options.until) this.active("cursor", date);
+  }
+
+  /** Explicit selections and completed MCP calls. Paths become local alias hashes. */
+  addCursorSelection(row: CursorAgentMetadata): void {
+    for (const call of row.mcpCalls ?? []) {
+      if (!Number.isSafeInteger(call.completedAtMs) || call.completedAtMs < 0 || call.completedAtMs > 8.64e15) throw new Error("Invalid Cursor MCP timestamp.");
+      const date = new Date(call.completedAtMs).toISOString().slice(0, 10);
+      if (date < this.options.since || date > this.options.until) continue;
+      if (!call.name || call.name.length > 128 || /[/\\\u0000-\u001f\u007f]/.test(call.name)) throw new Error("Invalid Cursor MCP server name.");
+      const key = JSON.stringify([row.conversationId, call.id]);
+      const previous = this.cursorMcpCalls.get(key);
+      if (previous && (previous.date !== date || previous.name !== call.name)) throw new Error("Conflicting Cursor MCP metadata.");
+      const value = previous ?? { date, name: call.name, records: new Set<string>() };
+      if (call.recordId !== undefined) {
+        if (!/^[a-f0-9]{64}$/.test(call.recordId)) throw new Error("Invalid Cursor MCP record identity.");
+        value.records.add(call.recordId);
+      }
+      this.cursorMcpCalls.set(key, value);
+      this.active("cursor", date);
+    }
+    const timestamp = row.startedAtMs ?? row.completedAtMs;
+    if (timestamp === undefined) return;
+    if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > 8.64e15) throw new Error("Invalid Cursor selection timestamp.");
+    const date = new Date(timestamp).toISOString().slice(0, 10);
+    if (date < this.options.since || date > this.options.until) return;
+    const artifacts = new Set<string>();
+    for (const path of row.skillPaths) {
+      if (!isAbsolute(path) || !/(?:^|[/\\])SKILL\.md$/.test(path)) continue;
+      try { artifacts.add(cursorArtifact(realpathSync(dirname(path)))); }
+      catch (error) {
+        // A removed skill can still match its previously captured local identity.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Could not resolve Cursor selected skill metadata.");
+        artifacts.add(cursorArtifact(dirname(path)));
+      }
+    }
+    const commands = [...new Set(row.commands)].sort();
+    if (commands.some(name => !name || name.length > 128 || /[/\\\u0000-\u001f\u007f]/.test(name))) throw new Error("Invalid Cursor selected command name.");
+    const selection = { date, commands, artifacts: [...artifacts].sort() };
+    const key = JSON.stringify([row.conversationId, row.messageId]);
+    const previous = this.cursorSelections.get(key);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(selection)) throw new Error("Conflicting Cursor selection metadata.");
+    this.cursorSelections.set(key, selection);
+    this.active("cursor", date);
+  }
 
   /**
    * A working directory from a transcript this pass did not parse whole.
@@ -1011,11 +1129,82 @@ export class CapabilityCollector {
         claimed.add(entry.realPath);
       }
     }
+    const cursorProjects = readCursorInventory(home, this.options.since, this.options.until);
+    for (const entry of cursorProjects) this.active("cursor", entry.date);
+    const cursor = this.activeDates.has("cursor") ? cursorInventory(home) : { skills: new Map<string, InstalledCapability>(), commands: new Map<string, InstalledCapability>() };
+    const projectNames = new Set<string>();
+    const artifacts = new Set<string>();
+    for (const entry of cursorProjects) {
+      const key = `${entry.kind}:${entry.name}`;
+      if (projectNames.has(key)) continue;
+      projectNames.add(key);
+      const artifact = `${entry.kind}:${entry.artifact}`;
+      const entries = entry.kind === "skill" ? cursor.skills : cursor.commands;
+      entries.set(entry.name, { name: entry.name, source: "project", realPath: `captured:${entry.artifact}`, descriptionTokens: entry.descriptionTokens, alias: artifacts.has(artifact) });
+      artifacts.add(artifact);
+    }
+    // A personal symlink to a captured project artifact is still one skill.
+    for (const [kind, entries] of [["skill", cursor.skills], ["command", cursor.commands]] as const) {
+      for (const entry of entries.values()) if (entry.source !== "project" && artifacts.has(`${kind}:${cursorArtifact(entry.realPath)}`)) entry.alias = true;
+    }
     const inventories: Record<CapabilityAgent, Inventory> = {
       "claude-code": inventory(home, cwds),
       codex: this.codexInstalled(),
       copilot: copilotInstalled,
+      cursor,
     };
+
+    // Rebuild this agent's selection buckets so finish() is repeatable. A path
+    // becomes a reported name only when an inventoried artifact establishes it.
+    for (const key of seen.keys()) if (key.startsWith("cursor|")) seen.delete(key);
+    // Forked conversations preserve immutable steps. Join call identities via
+    // shared record pointers before counting, including transitive replays.
+    const groups = new Map<string, string>();
+    const recordOwners = new Map<string, string>();
+    const group = (key: string): string => {
+      let root = key;
+      while (groups.get(root) !== root) root = groups.get(root)!;
+      while (key !== root) {
+        const parent = groups.get(key)!;
+        groups.set(key, root);
+        key = parent;
+      }
+      return root;
+    };
+    for (const key of this.cursorMcpCalls.keys()) groups.set(key, key);
+    for (const [key, call] of this.cursorMcpCalls) {
+      for (const record of call.records) {
+        const owner = recordOwners.get(record);
+        if (owner === undefined) recordOwners.set(record, key);
+        else {
+          const previous = this.cursorMcpCalls.get(owner)!;
+          if (previous.date !== call.date || previous.name !== call.name) throw new Error("Conflicting Cursor MCP record metadata.");
+          groups.set(group(key), group(owner));
+        }
+      }
+    }
+    const counted = new Set<string>();
+    for (const [key, call] of this.cursorMcpCalls) {
+      const root = group(key);
+      if (counted.has(root)) continue;
+      counted.add(root);
+      this.at("cursor", call.date, "mcp", call.name).invocations += 1;
+    }
+    for (const selection of this.cursorSelections.values()) {
+      const names = new Set<string>();
+      for (const artifact of selection.artifacts) {
+        const entry = [...cursor.skills.values()].find(entry => !entry.alias &&
+          (entry.realPath === `captured:${artifact}` || cursorArtifact(entry.realPath) === artifact));
+        if (entry) names.add(entry.name);
+      }
+      for (const [kind, selected] of [["skill", names], ["command", selection.commands]] as const) {
+        for (const name of selected) {
+          const b = this.at("cursor", selection.date, kind, name);
+          b.invocations += 1;
+          b.triggerTyped += 1;
+        }
+      }
+    }
 
     const out: CapabilityRecord[] = [];
     for (const [key, b] of seen) {
@@ -1045,11 +1234,13 @@ export class CapabilityCollector {
       });
     }
 
-    // Installed but never invoked, per agent. Reported against that agent's most
+    // Installed with no observed invocation, per agent. Cursor explicit
+    // selections do not measure automatic use, so zeros cannot establish disuse.
+    // Reported against that agent's most
     // recent active day so it lands in the window the dashboard is showing, and
     // not at all for an agent that never ran in the window. This is the row that
     // only a local collector can produce.
-    for (const agent of ["claude-code", "codex", "copilot"] as const) {
+    for (const agent of ["claude-code", "codex", "copilot", "cursor"] as const) {
       const anchor = [...(activeDates.get(agent) ?? [])].sort().pop();
       if (!anchor) continue;
       const inv = inventories[agent];
@@ -1124,6 +1315,13 @@ export class CapabilityCollector {
       // Ordinary Copilot CLI command events are ephemeral, unlike skill events.
       if (this.copilotCliActive && row.kind === "command") for (const key of ["invocations", "triggerTyped", "triggerModel", "contextTokens"] as const) missing.add(key);
       row.unavailableMetrics = [...missing].sort();
+    }
+    for (const row of out) if (row.agent === "cursor") {
+      const missing: CapabilityMetricKey[] = ["contextTokens", "descriptionTokens", "attributedTurns", "attributedTokens", "attributedCostMicros", "triggerModel"];
+      // Explicit selections measure typed use only, not automatic skill loads.
+      if (row.kind === "skill") missing.push("invocations");
+      if (row.kind === "mcp") missing.push("triggerTyped");
+      row.unavailableMetrics = missing.sort();
     }
     return out.sort(
       (a, b) => a.date.localeCompare(b.date) || b.invocations - a.invocations,

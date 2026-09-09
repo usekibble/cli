@@ -10,12 +10,15 @@
  */
 
 import type { PricingContext } from "./pricing.js";
+import type { CursorSource } from "./cursor.js";
 
 /** Shared dependencies whose cache lifetime is one collection run. */
 export interface SourceContext {
   pricing?: PricingContext;
   /** Override only for isolated collector fixtures. */
   home?: string;
+  /** Reuse one immutable Cursor snapshot for daily totals and sidecars. */
+  cursor?: CursorSource;
 }
 
 /**

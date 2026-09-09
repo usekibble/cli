@@ -157,7 +157,7 @@ Usage alone does not establish productivity, quality or the cause of a change.
 
 const DIR_NAME = "kibble-usage";
 
-/** Skill roots per agent: Claude Code always, Codex and Copilot when installed. */
+/** Skill roots per agent: Claude Code always, other agents when installed. */
 function roots(): { agent: string; dir: string; wanted: boolean }[] {
   const home = homedir();
   return [
@@ -171,6 +171,11 @@ function roots(): { agent: string; dir: string; wanted: boolean }[] {
       agent: "copilot",
       dir: join(copilotHome(home), "skills", DIR_NAME),
       wanted: existsSync(copilotHome(home)),
+    },
+    {
+      agent: "cursor",
+      dir: join(home, ".cursor", "skills", DIR_NAME),
+      wanted: existsSync(join(home, ".cursor")),
     },
   ];
 }

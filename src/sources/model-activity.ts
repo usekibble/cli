@@ -3,11 +3,14 @@ import { TranscriptDeduper } from "./transcript-dedup.js";
 import type { TranscriptVisitor } from "./transcripts.js";
 import { codexItem, codexSettings, codexTool, CodexTokenReader, count, object, text } from "./codex.js";
 import { ClaudeTokenReader } from "./claude.js";
+import type { CursorSample } from "./cursor.js";
+import type { CursorToolSample } from "./cursor-tools.js";
+import type { CursorActivitySample } from "./cursor-activity.js";
 
 /** Counts only, at (day, agent, model). Session and tool ids stay on the machine. */
 export interface ModelActivity {
   date: string;
-  agent: "claude-code" | "codex";
+  agent: "claude-code" | "codex" | "cursor";
   model: string;
   costMicros: number;
   tokens: number;
@@ -57,6 +60,29 @@ export class ModelActivityCollector {
     if (!this.seen.first(`${row.agent}:tool`, dedupScope, id)) return;
     row.toolCalls += 1;
     if (session) row.sessionIds.add(session);
+  }
+
+  addCursorTool(sample: CursorToolSample): void {
+    const row = this.at(sample.date, "cursor", sample.model);
+    if (!row) return;
+    row.toolCalls += 1;
+    row.sessionIds.add(sample.conversationId);
+  }
+
+  addCursorActivity(sample: CursorActivitySample): void {
+    this.at(sample.date, "cursor", sample.model)?.sessionIds.add(sample.conversationId);
+  }
+
+  /** Shares the daily source snapshot; stop events do not establish response counts. */
+  addCursor(sample: CursorSample): void {
+    const row = this.at(sample.date, "cursor", sample.model);
+    if (!row) return;
+    row.tokens += sample.tokensIn + sample.tokensOut + sample.tokensCacheRead + sample.tokensCacheWrite;
+    row.costMicros += this.options.priceOf?.(sample.model, {
+      input_tokens: sample.tokensIn, output_tokens: sample.tokensOut,
+      cache_read_input_tokens: sample.tokensCacheRead, cache_creation_input_tokens: sample.tokensCacheWrite,
+    }) ?? 0;
+    row.sessionIds.add(sample.conversationId);
   }
 
   claude(): TranscriptVisitor {

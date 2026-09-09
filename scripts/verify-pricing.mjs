@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { register } from "node:module";
@@ -65,7 +65,7 @@ globalThis.__kibblePricingFixture = {
   fallback: {
     daily: [{
       date: "2026-09-05",
-      agent: "cursor",
+      agent: "zed",
       model: "fallback-model",
       provider: null,
       tokensIn: 1,
@@ -93,7 +93,7 @@ try {
   const core = result.daily.find((row) => row.agent === "claude-code");
   assert.equal(core.messageCount, 3, "zero-token native records do not inflate response counts");
   assert.equal(core.costMicros, 1_200, "provider-a and provider-b retain distinct rates");
-  assert.equal(result.daily.find((row) => row.agent === "cursor").costMicros, 77);
+  assert.equal(result.daily.find((row) => row.agent === "zed").costMicros, 77);
   assert.equal(result.sessions.reduce((sum, session) => sum + session.costMicros, 0), 1_200);
   assert.equal(pricedCostMicros(usage, rates(1)), 300);
 
@@ -126,6 +126,56 @@ try {
   assert.equal(pricing.knownCostMicros("fixture-model", { ...usage, input: -1 }), null);
   assert.equal(pricing.costMicros("missingCache", usage), 90, "legacy cache fallbacks remain unchanged");
   assert.equal(pricing.costMicros("placeholder", usage), 0, "legacy unknown-price behavior remains unchanged");
+  // Fractional live durations must not lose calls, and model reconciliation
+  // must never move explicitly attributed tools onto a different model.
+  const { CursorSource, normalizeCursorStop, cursorUsagePath } = await import(`${dist}sources/cursor.js`);
+  const { normalizeCursorTool, cursorToolsPath, readCursorTools } = await import(`${dist}sources/cursor-tools.js`);
+  const observed = new Date("2026-09-05T12:00:00Z");
+  const metadata = { conversation_id: "00000000-0000-4000-8000-000000000001", generation_id: "00000000-0000-4000-8000-000000000002" };
+  const stop = normalizeCursorStop({ ...metadata, hook_event_name: "stop", model: "fixture-model", input_tokens: 10, output_tokens: 20, cache_read_tokens: 0, cache_write_tokens: 0 }, observed);
+  const toolPayload = { ...metadata, hook_event_name: "postToolUse", tool_name: "Shell", tool_use_id: "call_1", duration: 2625.198 };
+  const tool = normalizeCursorTool(toolPayload, observed);
+  assert.equal(tool.durationMs, 2625, "live fractional duration retains the completed call with rounded milliseconds");
+  assert.equal(normalizeCursorTool({ ...toolPayload, duration: 0.5 }, observed).durationMs, 1);
+  for (const duration of [-0.1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => normalizeCursorTool({ ...toolPayload, duration }, observed), /Invalid Cursor tool metadata/);
+  }
+  mkdirSync(join(home, ".config/kibble"), { recursive: true });
+  writeFileSync(cursorUsagePath(home), JSON.stringify(stop) + "\n");
+  writeFileSync(cursorToolsPath(home), [tool, tool,
+    { ...tool, toolId: "call_2", model: "explicit-subagent-model" },
+    { ...tool, toolId: "call_3", generationId: "00000000-0000-4000-8000-000000000003" },
+    { ...tool, toolId: "call_4", conversationId: "00000000-0000-4000-8000-000000000004" },
+  ].map(row => JSON.stringify(row) + "\n").join(""));
+  const cursor = new CursorSource({ home, pricing });
+  const options = { since: "2026-09-05", until: "2026-09-05" };
+  const cursorUsage = await cursor.collect(options);
+  const toolRows = cursor.toolSnapshot(options);
+  assert.equal(toolRows.length, 4, "repeated fractional tool events count only once");
+  assert.equal(toolRows[0].model, "fixture-model", "only the matching completed generation supplies a missing model");
+  assert.equal(toolRows[1].model, "explicit-subagent-model", "an explicit differing tool model is never overwritten or aliased");
+  assert.equal(toolRows[2].model, null, "another generation does not inherit the stop model");
+  assert.equal(toolRows[3].model, null, "another conversation does not inherit the stop model");
+  assert.equal(readCursorTools(cursorToolsPath(home))[0].model, null, "reconciliation leaves stored evidence unchanged");
+  assert.equal(cursorUsage.daily[0].costMicros, 150, "tool attribution does not add or reprice token usage");
+
+  // Lost calls and ID collisions: preserve the entire compound identity without
+  // writing its components or confusing it with a legacy single-component ID.
+  const ids = ['call_a\nnamespace_b', 'call_a\nnamespace_c', 'call_a_namespace_b', 'ab\nc', 'a\nbc', 'Call_a\nnamespace_b'];
+  const compoundTools = ids.map(tool_use_id => normalizeCursorTool({ ...toolPayload, tool_use_id }, observed));
+  assert.equal(new Set(compoundTools.map(r => r.toolId)).size, ids.length);
+  assert.equal(compoundTools[2].toolId, ids[2], 'legacy IDs are not migrated');
+  for (const tool_use_id of ['', 'a\n', '\na', 'a\n\nb', 'a\r\nb', 'a\tb', 'a b', 'a\n' + 'b'.repeat(129), Array(9).fill('a').join('\n'), compoundTools[0].toolId]) {
+    assert.throws(() => normalizeCursorTool({ ...toolPayload, tool_use_id }, observed), /Invalid Cursor tool metadata/);
+  }
+  const serializedTools = [...compoundTools, compoundTools[0]].map(r => JSON.stringify(r) + '\n').join('');
+  assert(!JSON.stringify(compoundTools[0]).includes('namespace_b'), 'raw compound components are not retained');
+  writeFileSync(cursorToolsPath(home), serializedTools);
+  const recovered = new CursorSource({ home, pricing });
+  assert.equal(recovered.toolSnapshot(options).length, ids.length, 'repeated compound callbacks count once');
+  assert.equal((await recovered.collect(options)).daily[0].costMicros, 150, 'recovering tools cannot inflate spend');
+  writeFileSync(cursorToolsPath(home), JSON.stringify({ ...compoundTools[0], toolId: ids[0] }) + '\n');
+  assert.throws(() => readCursorTools(cursorToolsPath(home)), /complete Cursor tool/);
 } finally {
   delete globalThis.__kibblePricingFixture;
   rmSync(home, { recursive: true, force: true });

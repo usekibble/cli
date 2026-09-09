@@ -7,6 +7,10 @@ import { RepoCollector, type RepoUsage } from "./repos.js";
 import { ModelActivityCollector, type ModelActivity } from "./model-activity.js";
 import { codexHome } from "./codex-inventory.js";
 import { scanVsCode } from "./vscode.js";
+import type { CursorSample } from "./cursor.js";
+import type { CursorToolSample } from "./cursor-tools.js";
+import type { CursorActivitySample } from "./cursor-activity.js";
+import { readCursorSelections } from "./cursor-store.js";
 import {
   harvestCwds,
   listJsonl,
@@ -34,6 +38,11 @@ export interface ScanOptions {
   copilotHome?: string;
   vscodeUserDataDirs?: string[];
   priceOf?: (model: string, usage: UsageCounts, provider?: string) => number;
+  /** Cursor usage days anchor inventory, never inferred invocation counts. */
+  cursorActiveDates?: Iterable<string>;
+  cursorSamples?: Iterable<CursorSample>;
+  cursorTools?: Iterable<CursorToolSample>;
+  cursorActivity?: Iterable<CursorActivitySample>;
 }
 
 export interface LocalScan {
@@ -56,6 +65,30 @@ export function scanLocal(
   const capabilityCollector = wantCapabilities
     ? new CapabilityCollector({ ...options, home, copilotHome: copilotRoot })
     : null;
+  for (const date of options.cursorActiveDates ?? []) capabilityCollector?.addCursorActivity(date);
+  for (const sample of options.cursorActivity ?? []) {
+    repoCollector?.addCursorActivity(sample);
+    modelCollector?.addCursorActivity(sample);
+    capabilityCollector?.addCursorActivity(sample.date);
+  }
+  for (const sample of options.cursorSamples ?? []) {
+    repoCollector?.addCursor(sample);
+    modelCollector?.addCursor(sample);
+    capabilityCollector?.addCursorActivity(sample.date);
+  }
+  for (const sample of options.cursorTools ?? []) {
+    repoCollector?.addCursorTool(sample);
+    modelCollector?.addCursorTool(sample);
+    capabilityCollector?.addCursorActivity(sample.date);
+  }
+  if (capabilityCollector) {
+    const appData = process.platform === "darwin" ? join(home, "Library", "Application Support")
+      : process.platform === "win32" ? (home === homedir() ? process.env.APPDATA : undefined) ?? join(home, "AppData", "Roaming")
+      : (home === homedir() ? process.env.XDG_CONFIG_HOME : undefined) ?? join(home, ".config");
+    for (const selection of readCursorSelections(join(appData, "Cursor", "User", "globalStorage", "state.vscdb"))) {
+      capabilityCollector.addCursorSelection(selection);
+    }
+  }
 
   const claude = partitionByFloor(listJsonl(join(home, ".claude", "projects")), floor);
   readTranscripts(claude.recent, [

@@ -55,56 +55,69 @@ function resolveTokscaleBin(): string {
   }
 }
 
-function run(args: string[]): Promise<string> {
+export function runTokscale(args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
     const bin = resolveTokscaleBin();
     const isJs = bin.endsWith(".js");
     const child = spawn(
       isJs ? process.execPath : bin,
       isJs ? [bin, ...args] : args,
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], ...(env ? { env: { ...process.env, ...env } } : {}) },
     );
 
     let stdout = "";
-    let stderr = "";
+    let bytes = 0;
+    let failure: Error | undefined;
+    const timer = setTimeout(() => {
+      failure = new Error("tokscale timed out.");
+      child.kill("SIGKILL");
+    }, 120_000);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (c: string) => (stdout += c));
-    child.stderr.on("data", (c: string) => (stderr += c));
+    child.stdout.on("data", (c: string) => {
+      bytes += Buffer.byteLength(c);
+      if (bytes > 64 * 1024 * 1024) {
+        failure = new Error("tokscale output exceeded the safety limit.");
+        child.kill("SIGKILL");
+      } else stdout += c;
+    });
+    // Errors from account commands can contain credentials or account ids.
+    child.stderr.on("data", () => {});
 
-    child.on("error", (err) =>
-      reject(
-        new Error(
-          `could not run tokscale (${err.message}). Reinstall @usekibble/cli to restore it.`,
-        ),
-      ),
-    );
+    child.on("error", () => {
+      clearTimeout(timer);
+      reject(new Error("Could not run tokscale. Reinstall @usekibble/cli to restore it."));
+    });
     child.on("close", (code) => {
+      clearTimeout(timer);
+      if (failure) return reject(failure);
       if (code === 0) return resolve(stdout);
       reject(
-        new Error(`tokscale exited ${code}: ${stderr.trim() || "no output"}`),
+        new Error(`tokscale exited ${code}. Check its installation or Cursor login.`),
       );
     });
   });
 }
 
 export class TokscaleCliSource implements UsageSource {
+  constructor(private readonly client?: string, private readonly env?: NodeJS.ProcessEnv) {}
   readonly name = "tokscale-cli";
   readonly coverage = "50+ local clients, no session ids";
 
   async version(): Promise<string> {
-    return (await run(["--version"])).trim();
+    return (await runTokscale(["--version"])).trim();
   }
 
   async collect({ since, until }: CollectOptions): Promise<CollectResult> {
-    const raw = await run([
+    const raw = await runTokscale([
       "graph",
+      ...(this.client ? ["--client", this.client] : []),
       "--since",
       since,
       "--until",
       until,
       "--no-spinner",
-    ]);
+    ], this.env);
 
     let parsed: GraphExport;
     try {
