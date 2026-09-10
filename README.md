@@ -201,6 +201,14 @@ receipt directory as a CI artifact if delivery fails and retry, for example:
 kibble ci upload "$RUNNER_TEMP/kibble-receipts/"*.json
 ```
 
+A receipt names the checkout it ran in, the same way laptop pushes do: the
+repository name from the git remote (or the directory name), and the branch.
+`kibble run` reads them from the working directory and the runner's own
+variables (`GITHUB_HEAD_REF`, `GITHUB_REF_NAME`, `CI_COMMIT_BRANCH` and the
+usual equivalents), because a pull-request checkout is a detached HEAD;
+`kibble ci collect` reads them from the session records. Never a path, never
+the `owner/` part of a slug; a value that still looks like one is dropped.
+
 The native session id is reduced to a stable hash-based UUID; filenames, paths
 and raw session ids are not sent. Copies of the same session retain their id,
 and repeated token snapshots or Claude response blocks count once. Appended

@@ -169,6 +169,12 @@ export const ACTIVITY_KEYS = [
   "hookErrors",
 ] as const satisfies readonly (keyof RepoActivity)[];
 
+/**
+ * Codex file changes carry no "the human rewrote this" marker, so the counter
+ * is unknown there, never zero: a zero would read as a perfect keep rate.
+ */
+const CODEX_UNAVAILABLE: readonly RepoMetricKey[] = ["userModified"];
+
 /** Cursor hooks do not establish these response, edit or attribution counters. */
 const CURSOR_UNAVAILABLE: readonly RepoMetricKey[] = [
   "messageCount", "thinkingBlocks", "textBlocks", "turnMessages", "turnMessagesMax",
@@ -543,7 +549,6 @@ export class RepoCollector {
           if (result && typeof result === "object" && !Array.isArray(result)) {
             const t = result as Rec;
             if (t.interrupted === true) a.interrupted += 1;
-            if (t.userModified === true) a.userModified += 1;
             if (t.dangerouslyDisableSandbox === true) a.sandboxDisabled += 1;
             if (typeof t.durationMs === "number") {
               a.toolTimed += 1;
@@ -551,6 +556,10 @@ export class RepoCollector {
             }
             if (Array.isArray(t.structuredPatch) && t.structuredPatch.length > 0) {
               a.edits += 1;
+              // A rewrite is counted on the edit it belongs to, so `userModified`
+              // never exceeds `edits`: a created file carries the flag and an empty
+              // patch, and counting it would deflate the keep rate.
+              if (t.userModified === true) a.userModified += 1;
               a.hunks += t.structuredPatch.length;
               for (const hunk of t.structuredPatch) a.diffLines(obj(hunk).lines);
             }
@@ -1070,8 +1079,9 @@ export class RepoCollector {
           tokensCacheWrite: a.tokensCacheWrite,
           messageCount: a.messageCount,
           costMicros: a.costMicros,
-          ...(agent === "copilot" || agent === "cursor" ? {
-            unavailableMetrics: [...new Set([...a.unavailableMetrics, ...(agent === "cursor" ? CURSOR_UNAVAILABLE : [])])].sort(),
+          ...(agent === "copilot" || agent === "cursor" || agent === "codex" ? {
+            unavailableMetrics: [...new Set([...a.unavailableMetrics,
+              ...(agent === "cursor" ? CURSOR_UNAVAILABLE : agent === "codex" ? CODEX_UNAVAILABLE : [])])].sort(),
           } : {}),
           facets,
           ...Object.fromEntries(ACTIVITY_KEYS.map((k) => [k, a[k]])),

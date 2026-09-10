@@ -5,9 +5,14 @@ import { collectCiTranscripts } from "../sources/ci-transcripts.js";
 import { ciUploadConfig, readCiReceipt, uploadCiReceipt } from "./ci.js";
 import { writeReceipt } from "./run.js";
 
-/** Recollection preserves the first saved quote when observed usage is unchanged. */
+/**
+ * Recollection preserves the first saved quote when observed usage is unchanged.
+ * The checkout name is left out too: a receipt saved by an older collector keeps
+ * its revision, and a revision cannot change its digest on the server.
+ */
 function accounting(receipt: CiReceipt): string {
-  return canonicalReceipt({ ...receipt, costMicros: null, costBasis: "unavailable",
+  const { workspace: _workspace, ...rest } = receipt;
+  return canonicalReceipt({ ...rest, costMicros: null, costBasis: "unavailable",
     models: receipt.models.map((model) => ({ ...model, costMicros: null })) });
 }
 

@@ -5,6 +5,7 @@ import { basename, resolve } from "node:path";
 import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { CiJsonLines, CiStreamCollector, type CiAgent } from "../sources/ci-stream.js";
 import type { CiReceipt } from "../ci-receipt.js";
+import { ciWorkspace, type CiWorkspace } from "../ci-workspace.js";
 import { ciUploadConfig, uploadCiReceipt } from "./ci.js";
 export type { CiReceipt } from "../ci-receipt.js";
 
@@ -69,7 +70,7 @@ export function writeReceipt(path: string, receipt: CiReceipt, first = false): v
 }
 
 /** Execute without a shell; retain only explicitly constructed receipt fields. */
-export async function captureCiRun(invocation: CiInvocation, receiptPath: string): Promise<{ receipt: CiReceipt; exitCode: number; saved: boolean }> {
+export async function captureCiRun(invocation: CiInvocation, receiptPath: string, workspace?: CiWorkspace): Promise<{ receipt: CiReceipt; exitCode: number; saved: boolean }> {
   const started = Date.now();
   const startedMono = performance.now();
   const collector = new CiStreamCollector(invocation.agent);
@@ -79,6 +80,7 @@ export async function captureCiRun(invocation: CiInvocation, receiptPath: string
     accountingScope: invocation.agent === "codex" ? "codex_main_thread" : "claude_query_including_subagents",
     startedAt: new Date(started).toISOString(), endedAt: null, durationMs: null,
     outcome: "running", process: { exitCode: null, signal: null, forwardedSignal: null }, ...collector.snapshot(),
+    ...(workspace ? { workspace } : {}),
   };
   // Reserve the destination before starting a paid run. Never overwrite a prior run.
   try { writeReceipt(receiptPath, receipt, true); }
@@ -163,7 +165,7 @@ export async function run(command: string[], options: { receipt?: string; upload
   if (!options.receipt) throw new Error("Use --receipt <file> before the agent command.");
   const invocation = ciInvocation(command);
   const upload = options.upload ? ciUploadConfig(options.server) : null;
-  const result = await captureCiRun(invocation, resolve(options.receipt));
+  const result = await captureCiRun(invocation, resolve(options.receipt), ciWorkspace(process.cwd()));
   process.exitCode = result.exitCode;
   console.log(`Kibble run ${result.receipt.runId}: ${result.receipt.outcome}; usage ${result.receipt.usageStatus}; cost ${result.receipt.costBasis}. ${result.saved ? "Receipt saved locally" : "Receipt save failed"}.`);
   if (upload) {

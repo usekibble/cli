@@ -2,6 +2,8 @@ import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { ciSessionKey } from "../ci-identity.js";
 import { ciReceiptSchema, transcriptRevision, type CiReceipt } from "../ci-receipt.js";
+import { ciWorkspaceOf } from "../ci-workspace.js";
+import { repoName } from "./repo.js";
 import { ClaudeTokenReader } from "./claude.js";
 import { CodexTokenReader, codexItem, codexTool, object } from "./codex.js";
 import { PricingContext, type PricingRef } from "./pricing.js";
@@ -66,6 +68,9 @@ interface Session {
   models: Map<string, { ref: PricingRef; tokens: CiTokens }>;
   unsupportedModel: boolean;
   activity: { toolCalls: number; toolErrors: number };
+  /** The first checkout and branch the session named; a job works in one. */
+  repo: string | null;
+  branch: string | null;
 }
 type CiPricing = Pick<PricingContext, "prefetch" | "knownCostMicros">;
 
@@ -93,7 +98,7 @@ export async function collectCiTranscripts(options: {
     if (!session) {
       if (sessions.size >= MAX_SESSIONS) throw new Error("Collect at most 100 CI sessions per directory.");
       session = { key, startedAt, observed: false, tokens: zero(), hasUsage: false, models: new Map(), unsupportedModel: false,
-        activity: { toolCalls: 0, toolErrors: 0 } };
+        activity: { toolCalls: 0, toolErrors: 0 }, repo: null, branch: null };
       sessions.set(key, session);
     }
     session.observed ||= observed;
@@ -116,6 +121,12 @@ export async function collectCiTranscripts(options: {
     }
     add(row.tokens, tokens);
   };
+  const place = (session: Session, cwd: unknown, branch: unknown, remote?: unknown) => {
+    if (session.repo === null && (identifier(cwd) || identifier(remote))) {
+      session.repo = repoName({ cwd: identifier(cwd) ? cwd : null, remoteUrl: identifier(remote) ? remote : null });
+    }
+    if (session.branch === null && identifier(branch)) session.branch = branch;
+  };
   const tool = (session: Session, id: unknown, failed = false) => {
     if (!identifier(id)) throw new Error("Missing CI tool identity.");
     if (seen.first(failed ? "error" : "tool", session.key, id)) {
@@ -136,6 +147,7 @@ export async function collectCiTranscripts(options: {
       return;
     }
     const session = at(record.sessionId, record.timestamp);
+    place(session, record.cwd, record.gitBranch);
     const message = object(record.message);
     if (record.type === "assistant") {
       const raw = optionalObject(message.usage);
@@ -163,7 +175,8 @@ export async function collectCiTranscripts(options: {
     if (["thread.started", "turn.completed", "result"].includes(String(record.type))) throw new Error("Use native Codex transcript files.");
     if (record.type === "session_meta") {
       codexSession = identifier(p.id) ? p.id : null;
-      at(codexSession, p.timestamp ?? record.timestamp, false);
+      const git = optionalObject(p.git);
+      place(at(codexSession, p.timestamp ?? record.timestamp, false), p.cwd, git.branch, git.repository_url);
     } else if (codexSession && ["turn_context", "event_msg", "response_item"].includes(String(record.type))) {
       at(codexSession, record.timestamp);
     }
@@ -228,6 +241,7 @@ export async function collectCiTranscripts(options: {
   finally { clearTimeout(timer); }
   const receipts: CiReceipt[] = [];
   for (const session of sessions.values()) {
+    const workspace = ciWorkspaceOf(session.repo, session.branch);
     const models = new Map<string, CiReceipt["models"][number]>();
     for (const row of session.models.values()) {
       const { input, output, cacheRead, cacheWrite } = row.tokens;
@@ -250,6 +264,7 @@ export async function collectCiTranscripts(options: {
       process: { exitCode: null, signal: null, forwardedSignal: null }, agentResult: null,
       usageStatus: tokens ? "partial" : "unavailable", tokens, models: rows, costMicros,
       costBasis: costMicros === null ? "unavailable" : "list_price_estimate", activity: session.activity,
+      ...(workspace ? { workspace } : {}),
       issues: ["transcript_usage_only", ...(session.unsupportedModel ? ["unsupported_model_name"] : [])],
     }));
   }

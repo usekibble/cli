@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 /**
  * Repo identity, without the path.
@@ -100,34 +100,42 @@ export function repoFromCwd(cwd: string | null | undefined): string | null {
  * that has since been deleted goes through the path heuristic instead.
  */
 export function repoFromDisk(cwd: string | null | undefined): string | null {
+  const found = findGitDir(cwd);
+  if (!found) return null;
+  try {
+    const config = readFileSync(join(found.root, ".git", "config"), "utf8");
+    const url = /^\s*url\s*=\s*(.+)$/m.exec(config)?.[1];
+    const fromRemote = repoFromRemote(url);
+    if (fromRemote) return fromRemote;
+  } catch {
+    /* no config or no remote; the directory name will do */
+  }
+  return repoFromCwd(found.root);
+}
+
+/**
+ * The nearest `.git` above a directory, as two answers: `root` is the main
+ * checkout, which is where a repo's name and remote live even for a linked
+ * worktree; `gitDir` is the directory that holds this checkout's own HEAD,
+ * which for a worktree is `<main>/.git/worktrees/<name>`. Both readers of the
+ * walk (the repo name here, the branch in the CI workspace) share it.
+ */
+export function findGitDir(cwd: string | null | undefined): { root: string; gitDir: string } | null {
   if (!cwd || !existsSync(cwd)) return null;
   let dir = cwd;
   for (let depth = 0; depth < 32; depth++) {
     const dotGit = join(dir, ".git");
-    let root: string | null = null;
     try {
-      if (statSync(dotGit).isDirectory()) {
-        root = dir;
-      } else {
-        // `gitdir: /main/.git/worktrees/<name>` -> /main
-        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
-        const target = m?.[1]?.trim();
-        const at = target?.replace(/\\/g, "/").indexOf("/.git/worktrees/") ?? -1;
-        root = target && at > 0 ? target.slice(0, at) : dir;
-      }
+      if (statSync(dotGit).isDirectory()) return { root: dir, gitDir: dotGit };
+      // A linked worktree keeps a `.git` FILE: `gitdir: /main/.git/worktrees/<name>`.
+      const target = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim();
+      const at = target?.replace(/\\/g, "/").indexOf("/.git/worktrees/") ?? -1;
+      return {
+        root: target && at > 0 ? target.slice(0, at) : dir,
+        gitDir: target ? (isAbsolute(target) ? target : resolve(dir, target)) : dotGit,
+      };
     } catch {
       /* no .git here; keep walking up */
-    }
-    if (root) {
-      try {
-        const config = readFileSync(join(root, ".git", "config"), "utf8");
-        const url = /^\s*url\s*=\s*(.+)$/m.exec(config)?.[1];
-        const fromRemote = repoFromRemote(url);
-        if (fromRemote) return fromRemote;
-      } catch {
-        /* no config or no remote; the directory name will do */
-      }
-      return repoFromCwd(root);
     }
     const parent = dirname(dir);
     if (parent === dir) break;

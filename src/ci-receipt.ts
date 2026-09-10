@@ -5,6 +5,17 @@ const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const tokens = z.object({ input: count, output: count, cacheRead: count, cacheWrite: count,
   reasoning: count.nullable() }).strict().refine((v) => v.reasoning === null || v.reasoning <= v.output);
 const model = tokens.safeExtend({ model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/), costMicros: count.nullable() });
+/**
+ * The checkout a run worked in, as the laptop sidecar already reports it: a
+ * repo NAME (never a path or a full slug) and a git branch name. These are the
+ * keys that let a CI receipt sit beside `repo_daily` and `repo_branches`, and
+ * later beside whatever the code host says merged. Omitted, not nulled, when
+ * nothing is known.
+ */
+const CI_REPO_NAME = /^(?!\.\.?$)[^\s/\\\x00-\x1f\x7f]{1,128}$/;
+const CI_BRANCH_NAME = /^(?![-/])(?!.*(?:\.\.|\/\/|\/$|\.lock$|@\{))[^\s\\~^:?*[\]\x00-\x1f\x7f]{1,255}$/;
+export const ciWorkspaceSchema = z.object({ repo: z.string().regex(CI_REPO_NAME).nullable(), branch: z.string().regex(CI_BRANCH_NAME).nullable() })
+  .strict().refine((w) => w.repo !== null || w.branch !== null);
 const signal = z.enum(["SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE", "SIGHUP", "SIGILL", "SIGINT",
   "SIGIO", "SIGIOT", "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT", "SIGSEGV", "SIGSTKFLT",
   "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGUNUSED", "SIGURG", "SIGUSR1",
@@ -23,6 +34,7 @@ export const ciReceiptSchema = z.object({
   models: z.array(model).max(128), costMicros: count.nullable(), costBasis: z.enum(["agent_estimate", "list_price_estimate", "unavailable"]),
   agentResult: z.enum(["succeeded", "failed"]).nullable(),
   activity: z.object({ toolCalls: count, toolErrors: count }).strict(),
+  workspace: ciWorkspaceSchema.optional(),
   issues: z.array(z.enum(["invalid_json", "oversized_record", "invalid_usage", "missing_final_usage", "main_agent_usage_only",
     "unsupported_model_name", "counter_limit", "stream_error", "transcript_usage_only"])).max(9),
 }).strict().superRefine((r, ctx) => {

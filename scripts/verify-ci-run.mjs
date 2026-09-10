@@ -16,6 +16,7 @@ import { captureCiRun, ciInvocation } from "../dist/commands/run.js";
 import { launchCommand } from "../dist/updates.js";
 import { collectCiTranscripts } from "../dist/sources/ci-transcripts.js";
 import { ciCollect } from "../dist/commands/ci-collect.js";
+import { ciWorkspace, ciWorkspaceOf } from "../dist/ci-workspace.js";
 
 const secret = "synthetic-private-content-must-never-leave";
 const codexFinal = {
@@ -133,7 +134,7 @@ try {
   const unknownPricing = { async prefetch() {}, knownCostMicros() { return null; } };
   const collect = (agent, sessionsDir, pricing = knownPricing) => collectCiTranscripts({ agent, sessionsDir, pricing });
   const claudeRecord = (id, input, output, cacheRead, cacheWrite) => ({
-    type: "assistant", sessionId: secret, timestamp: stamp, requestId: id, cwd: `/${secret}`,
+    type: "assistant", sessionId: secret, timestamp: stamp, requestId: id, cwd: `/${secret}/acme-api`, gitBranch: "feature/ci",
     message: { id, model: "fixture-model", usage: { input_tokens: input, output_tokens: output,
       cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheWrite },
     content: [{ type: "text", text: secret }, { type: "tool_use", id: `tool-${id}`, input: { path: secret } }] },
@@ -158,6 +159,7 @@ try {
   assert.equal(claudeReceipt.outcome, "unknown", "saved tokens do not establish a process exit status");
   assert.equal(claudeReceipt.costBasis, "list_price_estimate");
   assert.equal(JSON.stringify(claudeReceipt).includes(secret), false, "content, paths and raw session ids stay local");
+  assert.deepEqual(claudeReceipt.workspace, { repo: "acme-api", branch: "feature/ci" }, "a saved session names its checkout, never its path");
   assert.equal(ciReceiptSchema.safeParse(claudeReceipt).success, true);
   const unpricedClaude = (await collect("claude-code", claudeDir, unknownPricing))[0];
   assert.equal(unpricedClaude.costMicros, null);
@@ -232,7 +234,7 @@ try {
   const firstTokens = codexUsage(100, 20, 10, 2);
   const secondTokens = codexUsage(50, 10, 5, 1);
   const secondTotal = codexUsage(150, 30, 15, 3);
-  const codexRecords = [native("session_meta", { id: secret, timestamp: stamp, cwd: `/${secret}` }),
+  const codexRecords = [native("session_meta", { id: secret, timestamp: stamp, cwd: `/${secret}`, git: { branch: "feature/ci", repository_url: `https://example.invalid/${secret}/acme-api.git` } }),
     native("turn_context", { model: "model-a" }), tokenRecord(firstTokens, firstTokens), tokenRecord(firstTokens, firstTokens),
     native("turn_context", { model: "model-b" }), tokenRecord(secondTokens, secondTotal),
     native("event_msg", { type: "exec_command_end", call_id: secret, exit_code: 1, command: secret, output: secret })];
@@ -245,6 +247,32 @@ try {
   assert.deepEqual(codexReceipt.models.map((row) => [row.model, row.input, row.costMicros]), [["model-a", 80, 160], ["model-b", 40, 80]]);
   assert.deepEqual(codexReceipt.activity, { toolCalls: 1, toolErrors: 1 });
   assert.equal(JSON.stringify(codexReceipt).includes(secret), false);
+  assert.deepEqual(codexReceipt.workspace, { repo: "acme-api", branch: "feature/ci" }, "the remote names the repo; the slug and the path stay local");
+  // Names that still look like paths, slugs or shell-sensitive refs are dropped, not sent.
+  assert.equal(ciWorkspaceOf(`/${secret}`, "a b"), undefined);
+  assert.deepEqual(ciWorkspaceOf("acme-api", "refs..heads"), { repo: "acme-api", branch: null });
+  assert.deepEqual(ciWorkspaceOf(null, "release/2026.09"), { repo: null, branch: "release/2026.09" });
+  const checkout = directory("checkout");
+  fs.mkdirSync(join(checkout, ".git"));
+  writeFileSync(join(checkout, ".git", "HEAD"), "ref: refs/heads/main\n");
+  writeFileSync(join(checkout, ".git", "config"), `[remote "origin"]\n\turl = https://example.invalid/${secret}/acme-api.git\n`);
+  assert.deepEqual(ciWorkspace(checkout, {}), { repo: "acme-api", branch: "main" });
+  assert.deepEqual(ciWorkspace(checkout, { GITHUB_HEAD_REF: "pr-source", GITHUB_REF_NAME: "7/merge" }), { repo: "acme-api", branch: "pr-source" });
+  assert.deepEqual(ciWorkspace(checkout, { GITHUB_REF_NAME: "v1.2.3", GITHUB_REF_TYPE: "tag" }), { repo: "acme-api", branch: "main" }, "a tag build is not a branch");
+  assert.equal(JSON.stringify(ciWorkspace(checkout, { GITHUB_HEAD_REF: `/${secret}` })).includes(secret), false);
+  // Outside a checkout the runner names the repo; a scratch directory name is the last resort.
+  const scratch = directory("build");
+  assert.deepEqual(ciWorkspace(scratch, { GITHUB_REPOSITORY: `${secret}/acme-api`, GITHUB_REF_NAME: "main" }), { repo: "acme-api", branch: "main" });
+  assert.deepEqual(ciWorkspace(scratch, { CIRCLE_REPOSITORY_URL: "git@github.com:acme/acme-api.git" }), { repo: "acme-api", branch: null });
+  assert.deepEqual(ciWorkspace(scratch, {}), { repo: "build", branch: null });
+  for (const bad of [".", "..", "api\u001b[2Kx", "a\u0000b"]) assert.equal(ciWorkspaceOf(bad, "main\u0007")?.repo ?? null, null, `${JSON.stringify(bad)} is not a name`);
+  assert.equal(ciWorkspaceOf("acme-api", "main\u0007").branch, null);
+  // A linked worktree reads its own HEAD, not the main checkout's.
+  const worktree = directory("wt");
+  fs.mkdirSync(join(checkout, ".git", "worktrees", "wt"), { recursive: true });
+  writeFileSync(join(checkout, ".git", "worktrees", "wt", "HEAD"), "ref: refs/heads/wt-branch\n");
+  writeFileSync(join(worktree, ".git"), `gitdir: ${join(checkout, ".git", "worktrees", "wt")}\n`);
+  assert.deepEqual(ciWorkspace(worktree, {}), { repo: "acme-api", branch: "wt-branch" });
   const provisionalDir = directory("provisional-codex");
   const provisionalPath = join(provisionalDir, "session.jsonl");
   writeLines(provisionalPath, [native("session_meta", { id: "provisional-session", timestamp: stamp }), ...codexRecords]);
